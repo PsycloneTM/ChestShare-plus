@@ -1,0 +1,194 @@
+Internal development notes, kept as a running log while building this fork.
+For the public-facing summary of what changed vs. upstream ChestShare 0.2.3,
+see README.md instead. Version numbers below reflect internal iteration and
+do not match the version this fork is actually published under.
+
+ChestShare 0.3.8
+
+Two changes, prompted by comparing against a different mod's (proven, shipped)
+reflective Sophisticated Storage compat code:
+
+1. Simplified slot-count reflection. ContainerCompatibility now asks the
+   StorageWrapper itself for getNumberOfInventorySlots() first - a plain
+   public no-arg int method that was there all along. 0.3.6's BUILD_NOTES
+   claimed "IStorageWrapper itself has NO slot-count method at all" - true of
+   the IStorageWrapper *interface*, but the concrete StorageWrapper class
+   does declare one directly, which is what four versions of guessing at
+   InventoryHandler/ItemStackHandler method names (getSlots/getSlotCount/
+   getNumberOfInventorySlots/size) missed. The old InventoryHandler-probing
+   loop is kept as a fallback in case some other mod's wrapper doesn't expose
+   this method, but Sophisticated Storage itself now resolves on the first,
+   much simpler try.
+
+2. Fixed barrels (and other reflective-compat containers) opening completely
+   empty. This was NOT a reflection bug - 0.3.7's fix (removing the
+   premature register() calls from UseBlockCallback) was a correct diagnosis
+   of a race, but incomplete: it left registration entirely dependent on
+   Sophisticated Storage's own click-handling eventually calling
+   ServerPlayer#openMenu(...) in a way ServerPlayerEntityMixin could
+   intercept. That dependency is fragile and hard to verify by reading code
+   alone (it requires the compat mod's internal menu-opening path to funnel
+   through that exact vanilla method).
+
+   ChestShare now registers AND opens its shared-inventory menu in one step,
+   directly from UseBlockCallback, via the new
+   SharedContainerOpener.openCompatContainerForUse(). If it opens a menu, the
+   event is cancelled (InteractionResult.SUCCESS) so the block's own
+   click-handling - and its now-empty real menu - never runs. If there's
+   nothing to share, the event still falls through to PASS and vanilla/the
+   compat mod's own handling proceeds untouched, same as before. Registration
+   and "show the player what was registered" can no longer happen as two
+   separate, independently-triggered steps.
+
+   ServerPlayerEntityMixin's replaceFactory() path is left in place unchanged
+   as a defensive fallback for the rare case something opens a compat
+   container's menu through a route UseBlockCallback doesn't see. Note it
+   still uses the raw one-shot ContainerCompatibility.register() rather than
+   the new idempotent resolveCompatEntry(), so if a container was already
+   marked shared by the time that path runs, it will still fall through to
+   the real MenuProvider rather than rebuilding the shared one - this matches
+   its pre-0.3.8 behavior and is unchanged; it's just no longer the only path
+   that can register a compat container, so it's no longer the thing standing
+   between a barrel and an empty screen on ordinary use.
+
+--- previous notes below ---
+
+ChestShare 0.3.7
+
+Fixes Sophisticated Storage barrels (and any other reflective-compat storage)
+opening completely empty on every use, even though 0.3.6's slot-count fix was
+correct and compat-registration was succeeding.
+
+Root cause: ChestShare.java's UseBlockCallback called
+ContainerCompatibility.register() directly the moment a not-yet-shared
+reflective-compat container (e.g. a Sophisticated Storage barrel) was
+right-clicked. register() is a one-shot operation - it empties the block's
+real inventory into SharedContainersState and flips the SharedMarker flag -
+and this branch did nothing afterward but return InteractionResult.PASS, so
+the block's own click-handling continued and eventually called
+ServerPlayer#openMenu(...) (confirmed by extracting BarrelBlock/
+SophisticatedPlayer from the actual jars: their sophisticatedCore_openMenu
+helper calls straight through to the vanilla openMenu overloads). That call
+is intercepted by ServerPlayerEntityMixin, which routes to
+SharedContainerOpener.replaceFactory() - the code that actually builds the
+shared-inventory ChestMenu. But replaceFactory() also calls
+ContainerCompatibility.register() itself, and by then the container was
+already marked shared by the UseBlockCallback branch, so that second call
+returned null immediately. replaceFactory() then fell through and returned
+the original, unmodified MenuProvider, so the real Sophisticated Storage menu
+opened instead of ChestShare's - now showing nothing, because the first call
+had already emptied it.
+
+Fix: removed the direct ContainerCompatibility.register() calls from
+UseBlockCallback for the reflective-compat path entirely. replaceFactory()
+already performs registration immediately before building the shared menu,
+and is the only call site that should ever do so for this path - it fires
+whenever the block's own click-handling opens its menu, which covers
+Sophisticated Storage (and anything else that funnels through
+ServerPlayer#openMenu). No other behavior changed.
+
+--- previous notes below ---
+
+ChestShare 0.3.6
+
+Fixes the actual root cause of Sophisticated Storage boxes never getting
+shared: their real GUI kept opening (with the normal open animation and
+sound) exactly as if ChestShare weren't installed, because slot-count
+resolution was silently landing on 0 every time.
+
+This was found by extracting the real classes instead of guessing:
+sophisticatedcore's jar ships its Porting Lib dependency jar-in-jar
+under META-INF/jars/transfer-*.jar, which let us pull the actual
+io.github.fabricators_of_create.porting_lib.transfer.item.ItemStackHandler
+class file straight out of the mod's own libs and read its real method
+table.
+
+Confirmed facts (from that classfile, not assumed from Forge's API):
+- ItemStackHandler DOES declare a public getSlots() — but on this
+  Fabric build it returns List<ItemStackHandlerSlot>, not an int. It is
+  a different method from Forge's IItemHandler#getSlots():int that the
+  previous fix assumed it mirrored.
+- The actual int-returning slot-count method on this class is
+  getSlotCount(). InventoryHandler inherits it unchanged.
+- getStackInSlot(int)/setStackInSlot(int, ItemStack) exist on
+  InventoryHandler directly and were never the problem.
+
+Why 0.3.3's fix still didn't work:
+- 0.3.3 changed slot-count lookup to try method NAMES in order
+  ("getSlots", then getSlotCount/getNumberOfInventorySlots/size) and
+  used whichever name resolved first. getSlots() resolves fine (unlike
+  the two previous versions' guesses), so the lookup stopped right
+  there — but its return value is a List, `v instanceof Number` is
+  false, and slots silently stayed 0 anyway. Every symptom was
+  identical to the 0.3.1/0.3.2 bugs (real Sophisticated Storage menu
+  opens, real animation/sound plays, nothing gets shared) because the
+  net effect was the same: findHandler() returns null, so
+  ContainerCompatibility.register() bails out, so replaceFactory()
+  falls through to the real, unmodified MenuProvider.
+
+Fix:
+- Slot-count resolution now invokes each candidate name in turn
+  (getSlotCount, getSlots, getNumberOfInventorySlots, size) and only
+  accepts one whose return value is actually a Number, instead of
+  committing to the first NAME match regardless of what it returns.
+  getSlotCount is tried first since it's the confirmed-correct method
+  on this API, with the others kept as fallbacks for other mods.
+- The warnOnce() diagnostic wording was updated to match the new
+  try-order.
+
+Everything else from 0.3.3 (get/set resolution, the superclass method
+walk needed to find inherited methods, CobbleFurnies handling, no
+CHUNK_GENERATE scanning) is unchanged and was already correct.
+
+--- previous notes below ---
+
+ChestShare 0.3.3
+
+Fixes Sophisticated Storage still showing blank / exporting nothing after
+0.3.2. This time verified directly against the actual jars in libs/
+(sophisticatedstorage-1_21_1-*.jar, sophisticatedcore-1_21_1-*.jar) by
+parsing their classfiles, rather than guessing method names.
+
+Confirmed facts (from classfile inspection):
+- StorageBlockEntity.getStorageWrapper() exists and returns an
+  IStorageWrapper.
+- IStorageWrapper.getInventoryHandler() exists and returns
+  net.p3pp3rf1y.sophisticatedcore.inventory.InventoryHandler.
+- IStorageWrapper itself has NO slot-count method at all — only
+  getNumberOfSlotRows(), which is rows, not total slots.
+- InventoryHandler.getStackInSlot(int) and setStackInSlot(int, ItemStack)
+  DO exist, are public, and have exactly the expected signatures.
+- InventoryHandler does NOT declare getSlotCount() itself — that name
+  only exists on unrelated decorator classes (e.g.
+  CachedFailedInsertInventoryHandler). Both 0.3.1 (which looked for
+  getNumberOfInventorySlots) and 0.3.2 (which looked for getSlotCount)
+  were checking for slot-count method names that don't exist on this
+  object, so slots was always computed as 0 and the whole lookup bailed
+  out — even though get/set resolution was already correct.
+- InventoryHandler extends
+  io.github.fabricators_of_create.porting_lib.transfer.item.ItemStackHandler
+  (a Fabric Porting Lib class not present in our libs/ folder, so it
+  can't be introspected directly, but it's the standard Fabric port of
+  Forge's ItemStackHandler API and is expected to provide getSlots()).
+
+Fix:
+- Slot count now checked as getSlots() first (the one actually expected
+  to exist, inherited from the Porting Lib superclass), then falls back
+  to getSlotCount/getNumberOfInventorySlots/size for robustness against
+  future API changes.
+- findMethod(type, paramCount, names...) now checks Class.getMethods()
+  (which walks the full public inheritance chain, including interfaces
+  and superclasses from other packages/modules) before falling back to
+  a manual getDeclaredMethods() walk — needed because getSlots() lives
+  on an inherited superclass we can't see locally.
+- Added a warnOnce() diagnostic: if a storage-like block entity is found
+  but slot count or get/set can't be resolved, logs the handler's actual
+  runtime class name and which method names were tried, once per class
+  per session, so any future mismatch shows up in the log immediately
+  instead of silently doing nothing.
+
+- CobbleFurnies inventory access via inherited getItems/method_11282
+  unchanged.
+- Explicit compatibility is still attempted before generic
+  RandomizableContainerBlockEntity handling.
+- No CHUNK_GENERATE scanning.

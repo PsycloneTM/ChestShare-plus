@@ -1,0 +1,71 @@
+plugins {
+    id 'fabric-loom' version '1.10.1'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    // Local libs folder for offline dependencies
+    flatDir {
+        dirs 'libs'
+    }
+    // Cobblemon from Modrinth maven
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+        content {
+            includeGroup "maven.modrinth"
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Cobblemon — confirmed working via Modrinth's maven
+    modImplementation "maven.modrinth:cobblemon:${project.cobblemon_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+    
+    // Include the dependency jars in the build
+    from {
+        fileTree('libs') {
+            include '*.jar'
+        }
+    }
+}
+
+tasks.named('test') {
+    enabled = false
+}
