@@ -1,21 +1,21 @@
 # ChestShare+
-
+ 
 Per-player instanced loot for world-generated containers — 100% server-side.
-
+ 
 **This is a fork of [ChestShare](https://modrinth.com/mod/chestshare) by
 [Calamech](https://modrinth.com/user/Calamech)**, redistributed under the
 terms of Calamech's original [MIT license](LICENSE). All credit for the
 original concept, design, and implementation goes to Calamech — this fork
-builds on that foundation with additional compatibility, a rewritten async
-import system, and a number of bugfixes described below.
-
+builds on that foundation with additional container compatibility and a
+rewritten async import system, described below.
+ 
 If you don't need any of the changes below, use the original
 [ChestShare](https://modrinth.com/mod/chestshare) instead.
-
+ 
 ## What's different from ChestShare 0.2.3
-
+ 
 ### New
-
+ 
 - **Modded/reflective container support** — containers from mods that don't
   implement vanilla `Container` (e.g. Sophisticated Storage barrels/chests)
   are now detected and shared via reflection, alongside vanilla chests,
@@ -33,36 +33,8 @@ If you don't need any of the changes below, use the original
   chunk that merely loads for the first time under this mod. This means
   installing the mod on an existing world will never sweep up a player's
   own already-placed modded storage.
-
-### Fixed
-
-A number of real bugs were found and fixed relative to the original 0.2.3
-behavior:
-
-- Converted containers (vanilla and modded) could end up **permanently
-  empty** on every open — a loot table lookup used the wrong registry
-  access path and never found anything.
-- Loot from a converted container was **packed into the first few slots**
-  instead of scattered the way vanilla loot generation normally spreads it.
-- Modded/reflective containers (e.g. Sophisticated Storage) could become
-  **unopenable after the first use** — the registration call wasn't
-  idempotent, so every open after the first returned nothing to display.
-- The Sophisticated Storage slot-count reflection lookup could silently
-  bind to a wrong-typed method and always report zero slots, with no
-  warning logged anywhere.
-- `/chestshare reset` semantics are restored to "clear cached rolls, keep
-  the container shared" (its original intent) after drifting into an
-  unrelated "un-share" behavior.
-- Re-running `/chestshare convert` on the same position could roll
-  **different loot each time** instead of being deterministic for that
-  position.
-- Import tab-complete for `status`/`cancel` now only appears while a job is
-  actually running, and the file-import options only appear while one
-  isn't — both update live for already-connected players instead of only
-  reflecting server state from when they logged in.
-
 ## Commands (op level 2)
-
+ 
 | Command                                        | Effect                                                                      |
 | ----------------------------------------------- | ---------------------------------------------------------------------------- |
 | `/chestshare convert <pos> <loot_table>`        | Convert one container into a shared container with the given loot table    |
@@ -71,9 +43,9 @@ behavior:
 | `/chestshare import <file> [force] [parallel N]`| Apply an export to this world, in the background (recovery)                |
 | `/chestshare import status`                     | Show progress of a running import (only visible while one is active)       |
 | `/chestshare import cancel`                     | Cancel a running import (only visible while one is active)                 |
-
+ 
 ## Good to know
-
+ 
 - Fabric, Minecraft 1.21.1, Java 21. Requires Fabric API. Server-side only
   (also works in singleplayer/LAN).
 - Built against official Mojang mappings.
@@ -87,7 +59,7 @@ behavior:
   fresh chunk-generation event, or a player opening the container, does.
 - Fully custom container implementations with no vanilla-style inventory
   underneath aren't covered.
-
 ## License
-
+ 
 MIT — see [LICENSE](LICENSE). Original work Copyright (c) 2026 Calamech.
+ 
