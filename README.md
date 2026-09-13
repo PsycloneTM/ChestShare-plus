@@ -58,7 +58,7 @@ If you don't need any of the changes below, use the original
   a chunk merely being *loaded* doesn't register anything by itself. A
   fresh chunk-generation event, or a player opening the container, does.
 - Fully custom container implementations with no vanilla-style inventory
-  underneath aren't covered.
+  underneath are covered.
 ## License
  
 MIT — see [LICENSE](LICENSE). Original work Copyright (c) 2026 Calamech.
