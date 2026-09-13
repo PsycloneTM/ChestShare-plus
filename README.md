@@ -74,9 +74,6 @@ If you don't need any of the changes below, use the original
   generically via `Container`.
 
 ## License
-
-MIT — see [LICENSE](LICENSE). Original work Copyright (c) 2026 Calamech.
-## License
  
 MIT — see [LICENSE](LICENSE). Original work Copyright (c) 2026 Calamech.
  
