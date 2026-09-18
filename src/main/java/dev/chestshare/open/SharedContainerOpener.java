@@ -6,7 +6,6 @@ import dev.chestshare.SharedMarker;
 import dev.chestshare.state.ContainerTemplate;
 import dev.chestshare.state.SharedContainerEntry;
 import dev.chestshare.state.SharedContainersState;
-import dev.chestshare.compat.ContainerCompatibility;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -41,8 +40,8 @@ public final class SharedContainerOpener {
                     SharedContainerEntry entry=resolveGenericEntry(world,be,container);
                     if(entry!=null) return blockContainerFactory(world,be.getBlockPos(),entry,factory);
                 } else {
-                    // Must use resolveCompatEntry, not ContainerCompatibility.register()
-                    // directly - see NOTES.md, this was a real "storage becomes unopenable" bug.
+                    // resolveCompatEntry only resolves an ALREADY-registered entry, never
+                    // registers a new one here - see NOTES.md.
                     SharedContainerEntry entry=resolveCompatEntry(world,be);
                     if(entry!=null) return blockContainerFactory(world,be.getBlockPos(),entry,factory);
                 }
@@ -72,15 +71,23 @@ public final class SharedContainerOpener {
         return true;
     }
 
-    /** Idempotent resolve for the reflective-compat path - see NOTES.md. */
+    /** Resolves an ALREADY-registered shared entry for the reflective-compat path - see
+     *  NOTES.md. Deliberately never registers a new one: unlike vanilla containers (which
+     *  have a real per-container signal, an untouched loot table, that's safe to check on
+     *  open) or generic modded containers scanned via ContainerScanner (gated on
+     *  freshlyGenerated), a reflective-compat container has no equivalent per-container
+     *  signal, and "on open" has no way to check chunk freshness retroactively. Registering
+     *  here unconditionally used to auto-convert a player's own freshly-placed Sophisticated
+     *  Storage container into a shared container the first time they opened it - a real bug.
+     *  Registration for these containers must only ever happen via the freshlyGenerated-gated
+     *  passive scan in ContainerScanner. */
     private static SharedContainerEntry resolveCompatEntry(ServerLevel world, BlockEntity be) {
         SharedContainersState state = SharedContainersState.get(world);
         BlockPos pos = be.getBlockPos();
         SharedContainerEntry entry = state.getBlock(pos);
         boolean marked = be instanceof SharedMarker m && m.chestshare$isShared();
         if (entry != null && !marked) { state.removeBlock(pos); return null; }
-        if (entry != null) return entry;
-        return ContainerCompatibility.register(world, be, true);
+        return entry;
     }
 
     private static SharedContainerEntry resolveGenericEntry(ServerLevel world, BlockEntity be, Container container) {

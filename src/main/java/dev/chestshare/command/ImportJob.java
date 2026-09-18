@@ -113,6 +113,8 @@ public final class ImportJob {
                 releaseTicket(work);
                 this.inFlight.remove(i);
             } else if (now - flight.requestedTick >= CHUNK_LOAD_TIMEOUT_TICKS) {
+                ChestShare.LOGGER.warn("Import: chunk {} in {} did not finish loading within {} ticks - counting its {} position(s) as missing",
+                        work.chunkPos(), work.world().dimension().location(), CHUNK_LOAD_TIMEOUT_TICKS, work.positions().size());
                 countMissing(work.positions().size());
                 releaseTicket(work);
                 this.inFlight.remove(i);
@@ -244,6 +246,13 @@ public final class ImportJob {
                     }
                 } else {
                     this.skippedMissing++;
+                    if (be == null) {
+                        ChestShare.LOGGER.info("Import: missing - no block entity at {} in {}",
+                                entry.pos(), world.dimension().location());
+                    } else {
+                        ChestShare.LOGGER.info("Import: missing - block entity at {} in {} is {} (not a recognized container type)",
+                                entry.pos(), world.dimension().location(), be.getClass().getName());
+                    }
                 }
                 done++;
                 advanceProgress();

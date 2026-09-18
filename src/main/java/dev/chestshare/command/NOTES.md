@@ -116,3 +116,21 @@ itself to be FULL status; there is no reason to wait for ticking here.
 **`skippedMissing` folding** — see the `importContainers()` note above; the
 same reasoning applies here for positions whose chunk never loads in time
 (`CHUNK_LOAD_TIMEOUT_TICKS`).
+
+**`skippedMissing` now logs why, per position.** There are two distinct ways
+a position can end up counted as missing, and both now log at the point they
+happen instead of only contributing to a bare final count:
+- The whole chunk never finished loading within `CHUNK_LOAD_TIMEOUT_TICKS`
+  (30s) — logged once per chunk, at `WARN`, listing how many positions in
+  that chunk were affected.
+- The chunk loaded fine, but `chunk.getBlockEntity(pos)` at that specific
+  position wasn't a recognized container — logged once per position, at
+  `INFO`, either "no block entity at all" or the actual class name found
+  there. This is the common real-world case: the export file's position no
+  longer matches what's actually built there (block broken/replaced since
+  export, or the export came from a different world/seed than the one being
+  imported into).
+
+Before this logging existed, a nonzero `missing` count in the final summary
+was undiagnosable — there was no way to tell "which positions" or "why"
+without editing the code.

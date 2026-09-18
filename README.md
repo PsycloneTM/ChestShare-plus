@@ -61,19 +61,25 @@ If you don't need any of the changes below, use the original
 - Container support covers: vanilla chests, barrels, shulker boxes, and chest
   minecarts; any modded block entity that implements vanilla's `Container`
   interface — this covers a lot of storage mods for free, since many
-  decorative/simple storage mods (e.g. Carved Wood's chests and barrels)
-  build directly on vanilla's own container implementation; and, by name,
-  Sophisticated Storage and CobbleFurnies specifically, which don't
-  implement `Container` and are supported via reflection instead. A mod
-  whose storage is fully custom — neither `Container`-based nor one of
-  those two named integrations — isn't covered, and would need its own
-  dedicated support the way Sophisticated Storage and CobbleFurnies got.
+  decorative/simple storage mods build directly on vanilla's own container
+  implementation (confirmed by testing with Carved Wood's chests and
+  barrels; Cobblemon's Gilded Chest also appears to be `Container`-based,
+  based on how other mods treat it, though it hasn't been directly tested
+  here); and, by name, Sophisticated Storage and CobbleFurnies specifically,
+  which don't implement `Container` and are supported via reflection
+  instead. A mod whose storage is fully custom — neither `Container`-based
+  nor one of those two named integrations — isn't covered, and would need
+  its own dedicated support the way Sophisticated Storage and CobbleFurnies
+  got.
 - Verified against the official [COBBLEVERSE](https://modrinth.com/modpack/cobbleverse)
   modpack's world-generated storage: Sophisticated Storage, Sophisticated
   Core, and CobbleFurnies are supported by name, and Carved Wood is covered
-  generically via `Container`.
+  generically via `Container`. (Tom's Simple Storage and Sophisticated
+  Backpacks are also present in that pack, but neither adds a new
+  world-generated loot container — Tom's Storage networks existing chests,
+  and Backpacks are carried equipment — so they're out of scope for this
+  mod either way.)
 
 ## License
- 
+
 MIT — see [LICENSE](LICENSE). Original work Copyright (c) 2026 Calamech.
- 
