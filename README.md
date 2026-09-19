@@ -44,6 +44,35 @@ If you don't need any of the changes below, use the original
 | `/chestshare import <file> [force] [parallel N]`| Apply an export to this world, in the background (recovery)                |
 | `/chestshare import status`                     | Show progress of a running import (only visible while one is active)       |
 | `/chestshare import cancel`                     | Cancel a running import (only visible while one is active)                 |
+| `/chestshare adopt-structure <pos>`             | Adopt all storage containers at their correct template positions in the structure at `<pos>`, restoring each one's original loot — baked items or loot table (only visible after server startup completes) |
+| `/chestshare toggle restore-empty-structures [true\|false]` | View or set whether the passive scan may refill and share an empty structure container it finds in an already-existing chunk (see Configuration below). With no argument, reports the current value. |
+
+## Configuration
+
+The one setting ChestShare+ has — whether the passive scan is allowed to touch empty
+structure containers in chunks that already existed before the mod was installed — is a
+runtime toggle, not a file to hand-edit:
+
+```
+/chestshare toggle restore-empty-structures true
+/chestshare toggle restore-empty-structures false
+/chestshare toggle restore-empty-structures      # reports the current value
+```
+
+**Default: off.** When on, an already-loaded chunk's **empty** container that sits at
+exactly the position — and is exactly the block — a registered structure template places
+a storage block is refilled with the template's original loot (baked items or loot table)
+and made a shared container. Non-empty containers, containers the template places empty,
+multi-palette templates, and structures the game doesn't identify outright are left alone;
+use `/chestshare adopt-structure` for those instead.
+
+The value persists across restarts once set (saved to a small state file in the config
+directory — not meant to be hand-edited; use the command). A fresh install, or a missing/
+unreadable state file, always falls back to off.
+
+Known limitation: a player who uses a structure's own storage block as personal storage will see it
+refilled and made per-player if it happens to be empty when its chunk loads. That is why this is off
+by default.
 
 ## Good to know
 

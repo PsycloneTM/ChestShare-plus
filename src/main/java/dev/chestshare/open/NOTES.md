@@ -54,3 +54,22 @@ position previously had an entry but the block entity isn't currently marked
 shared (e.g. the block was replaced), the stale entry is removed and `null`
 is returned, matching the same pattern `resolveGenericEntry` and
 `resolveBlockEntry` use elsewhere in this file.
+
+**Why this doesn't use a "was this position inside a generated structure"
+check (`StructureManager#getStructureWithPieceAt`) instead of relying only on
+`freshlyGenerated`.** That API is real and would be a genuine improvement for
+vanilla/`Container`-based containers — it can distinguish "this chest is
+inside a village house" from "this chest is a player's own base" even on old,
+already-explored chunks, which `freshlyGenerated` can't do retroactively.
+But it doesn't help here: Sophisticated Storage and CobbleFurnies are
+player-craftable furniture, not structure loot — neither mod places its
+containers as part of any generated structure's pieces. There is no
+"genuine world-gen instance" of these containers for such a check to ever
+distinguish from a player-placed one; every one that will ever exist on a
+server is player-placed by construction. So for these two mods specifically,
+"never auto-register on open" isn't a stopgap waiting for a smarter check —
+it's the correct final behavior. An admin who deliberately wants to share a
+specific Sophisticated Storage/CobbleFurnies container (e.g. staging a
+hand-placed reward chest for an event) already has the right tool for that:
+`/chestshare convert <pos> <loot_table>` already has a modded/compat branch
+for exactly this deliberate, one-position-at-a-time opt-in.

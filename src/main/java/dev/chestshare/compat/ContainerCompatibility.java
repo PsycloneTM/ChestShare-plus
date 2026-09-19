@@ -5,6 +5,7 @@ import dev.chestshare.SharedMarker;
 import dev.chestshare.state.ContainerTemplate;
 import dev.chestshare.state.SharedContainerEntry;
 import dev.chestshare.state.SharedContainersState;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
@@ -71,6 +72,94 @@ public final class ContainerCompatibility {
         LOGGER.info("[ChestShare] compat-registered '{}' at {} in {} ({} slots, {} non-empty)",
                 be.getClass().getName(), be.getBlockPos(), world.dimension().location(),
                 inv.size(), copy.stream().filter(s -> !s.isEmpty()).count());
+        return entry;
+    }
+
+    /**
+     * Registers (or re-registers) a compat container with a specific item list from the
+     * structure template, rather than stealing the container's current live contents.
+     * Used by /chestshare adopt-structure to restore original baked loot regardless of
+     * whether the container has already been looted, emptied, or registered with wrong
+     * contents. Unlike register(), this succeeds even if the live container is empty,
+     * and replaces any existing SharedContainersState entry for this position.
+     */
+    public static SharedContainerEntry registerWithItems(ServerLevel world, BlockEntity be,
+            List<FingerprintRegistry.FingerprintItem> bakedItems, boolean markDirty) {
+        if (!(be instanceof SharedMarker marker)) return null;
+        CompatInventory inv = getContainerInventory(be);
+        if (inv == null || inv.size() <= 0) return null;
+
+        List<ItemStack> stacks = toStacks(bakedItems, inv.size());
+
+        // Clear the live container (whatever it currently holds)
+        for (int i = 0; i < inv.size(); i++) inv.set(i, ItemStack.EMPTY);
+        marker.chestshare$setShared(true);
+        if (markDirty) be.setChanged();
+
+        SharedContainerEntry entry = new SharedContainerEntry(
+                new ContainerTemplate.ItemListTemplate(stacks, inv.size()));
+        SharedContainersState state = SharedContainersState.get(world);
+        state.putBlock(be.getBlockPos(), entry);
+        state.setDirty();
+        long nonEmpty = stacks.stream().filter(s -> !s.isEmpty()).count();
+        LOGGER.debug("[ChestShare] adopt-registered '{}' at {} in {} ({} baked items from template)",
+                be.getClass().getName(), be.getBlockPos(), world.dimension().location(), nonEmpty);
+        return entry;
+    }
+
+    /**
+     * Builds an inventory-sized ItemStack list out of a template's baked FingerprintItems,
+     * placing each one at its recorded slot - NOT by list position. Sophisticated Storage and
+     * CobbleFurnies both save Items as a sparse, non-sequential list (e.g. slots 0,22,8,10 in
+     * one real barrel), so treating list position i as slot i silently scrambles every item
+     * into the wrong slot. See FingerprintItem's javadoc and compat/NOTES.md.
+     */
+    public static List<ItemStack> toStacks(List<FingerprintRegistry.FingerprintItem> bakedItems, int size) {
+        List<ItemStack> stacks = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) stacks.add(ItemStack.EMPTY);
+        for (FingerprintRegistry.FingerprintItem fi : bakedItems) {
+            int slot = fi.slot();
+            if (slot < 0 || slot >= size) continue;
+            ResourceLocation itemId = ResourceLocation.tryParse(fi.id());
+            if (itemId == null) continue;
+            // BuiltInRegistries.ITEM is a DefaultedRegistry<Item>: plain get(id) never
+            // returns null, it silently falls back to minecraft:air for an unknown id -
+            // which would plant a bogus air stack instead of skipping it. getOptional(id)
+            // is the variant that actually reports "not registered" as empty.
+            net.minecraft.world.item.Item item = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getOptional(itemId).orElse(null);
+            if (item != null) stacks.set(slot, new ItemStack(item, fi.count()));
+        }
+        return stacks;
+    }
+
+    /**
+     * Registers (or re-registers) a compat container against a loot table taken from the
+     * structure template, for containers whose template bakes a `LootTable` rather than real
+     * items (Cobblemon's gilded chest and friends). The live container is emptied and every
+     * player rolls the table for themselves on open, exactly like /chestshare convert does.
+     *
+     * Only for containers that are NOT RandomizableContainerBlockEntity - those have a native
+     * loot-table slot on the block entity itself that must also be cleared, which is
+     * ContainerRegistrar.applyTemplate's job.
+     */
+    public static SharedContainerEntry registerWithLootTable(ServerLevel world, BlockEntity be,
+            ResourceLocation lootTable, long seed, boolean markDirty) {
+        if (!(be instanceof SharedMarker marker) || lootTable == null) return null;
+        CompatInventory inv = getContainerInventory(be);
+        if (inv == null || inv.size() <= 0) return null;
+
+        for (int i = 0; i < inv.size(); i++) inv.set(i, ItemStack.EMPTY);
+        marker.chestshare$setShared(true);
+        if (markDirty) be.setChanged();
+
+        SharedContainerEntry entry = new SharedContainerEntry(
+                new ContainerTemplate.LootTableTemplate(lootTable, seed, inv.size()));
+        SharedContainersState state = SharedContainersState.get(world);
+        state.putBlock(be.getBlockPos(), entry);
+        state.setDirty();
+        LOGGER.debug("[ChestShare] adopt-registered '{}' at {} in {} (loot table {}, seed {})",
+                be.getClass().getName(), be.getBlockPos(), world.dimension().location(), lootTable, seed);
         return entry;
     }
 

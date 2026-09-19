@@ -3,8 +3,10 @@ package dev.chestshare;
 import dev.chestshare.command.ChestShareCommands;
 import dev.chestshare.command.ImportJob;
 import dev.chestshare.compat.ContainerCompatibility;
+import dev.chestshare.compat.FingerprintRegistry;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.world.level.chunk.LevelChunk;
 import java.util.Queue;
@@ -42,10 +44,15 @@ public class ChestShare implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        ChestShareConfig.load();
+
         // See NOTES.md: CHUNK_GENERATE registration
         ServerChunkEvents.CHUNK_GENERATE.register((world, chunk) -> {
             FRESHLY_GENERATED_CHUNKS.add(chunk.getPos().toLong());
         });
+
+        ServerLifecycleEvents.SERVER_STARTED.register(server ->
+                FingerprintRegistry.buildOnServerStart(server));
 
         ServerChunkEvents.CHUNK_LOAD.register((world, chunk) -> {
             if (world instanceof net.minecraft.server.level.ServerLevel serverWorld) {

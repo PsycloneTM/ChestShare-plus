@@ -105,3 +105,109 @@ nothing logged.
 - Generic modded `Container` branch: last-resort fallback for other inventory
   block entities that do implement vanilla `Container` but weren't caught by
   `getContainerInventory`'s direct check (defensive, kept simple on purpose).
+
+## FingerprintRegistry.java
+
+Scans every `.nbt` structure template registered on this server at `SERVER_STARTED`
+time (via `ResourceManager#listResources("structure", ...)` + `NbtIo#readCompressed`),
+and builds a `Set<Set<FingerprintItem>>` of every distinct non-empty item-set found
+baked into a Sophisticated Storage or CobbleFurnies block entity's NBT.
+
+**`CompoundTag#getList(key, type)` returns an EMPTY list on an element-type mismatch — this once
+made the whole registry silently empty.** Structure NBT's `blocks` and `palette` are lists of
+compounds (type 10); only `palettes` (a list of palettes) is a list of lists (type 9). The scanner
+originally asked for type 9 on `blocks` and `palette`, so `getList` returned nothing, every structure
+recorded zero storage blocks, and every downstream feature that depends on the registry (fingerprint
+auto-share, `adopt-structure` by id / layout / content alignment) had nothing to work with. The scan
+log line still looked healthy ("N structures scanned"), which is why it went unnoticed; it now also
+warns if structures were read but no storage blocks were recorded. Always match `getList`'s type
+argument to the ELEMENT type, not "list".
+
+**The scan records three kinds of storage block, not one.** Originally it recorded only blocks whose
+id matched `sophisticatedstorage:` / `cobblefurnies:`, which silently excluded every vanilla-style
+loot container - vanilla chests and barrels, and Cobblemon's gilded chest among modded ones. Those
+bake no items into the template at all, only a `LootTable` string, so they are invisible both to the
+id filter and to any items-based check. A block is now recorded when it carries a baked `LootTable`
+(any namespace - that tag alone is a definitive world-gen-loot signal), when its id is SS/CF as
+before, or when its id looks like a container in any namespace. `StructureStorageBlock` carries the
+loot table and seed alongside the items, and only a block with neither is "empty in the template".
+See `command/NOTES.md` for what `adopt-structure` then does with each kind, and keep this filter in
+agreement with `ChestShareCommands#isAdoptableContainer` - a recorded template position that no live
+container can ever satisfy weakens both the layout matcher and the content aligner.
+
+**`FingerprintItem` carries `slot`, not just `id`/`count` — and the fingerprint set is
+a `Set<Set<...>>`, not `Set<List<...>>`.** Both mods save `Items` as a sparse,
+non-sequential list: real examples pulled from COBBLEVERSE's `team_rocket_tower.nbt`
+had slots `0, 3, 5, 7` in one barrel and `0, 22, 8, 10` — not even ascending — in
+another. An earlier version of this class dropped `Slot` entirely and matched/restored
+items by list position, which (a) let `registerWithItems` scramble every baked item
+into the wrong physical slot, and (b) made fingerprint matching order-sensitive to an
+NBT list order that doesn't reliably track slot order in the first place. Comparing as
+unordered `Set<FingerprintItem>` (slot+id+count) fixes both: restoration places each
+item at its actual recorded slot, and two structurally identical containers match
+regardless of what order their NBT happened to serialize in.
+
+**Why raw NBT instead of `StructureTemplate`/`StructureTemplateManager` objects?**
+`StructureTemplate`'s internal palette list has no confirmed public Mojmap accessor
+in 1.21.1 (the field `palettes` is private, and the method summary shows no public
+getter for it — vanilla only ever accesses it internally via
+`StructurePlaceSettings#getRandomPalette`). Using `NbtIo#readCompressed(InputStream,
+NbtAccounter)` directly reads the same data from the resource stream without needing
+any internal API, and the parsing logic was validated against 3,686 real structure
+files from COBBLEVERSE's actual datapacks, matching a ground-truth fingerprint
+database at 68/68 structures.
+
+**Why content-only matching in `matchesKnownFingerprint` (no position)?** This part is
+still true for that specific method: it exists as a cheap, structure-independent
+signal (e.g. for `ContainerScanner`'s passive discovery path), and reconstructing a
+full placement transform there would require knowing which structure a given world
+position belongs to in the first place, not just whether its contents look
+structure-baked. **This is no longer the only tool available, though** — see
+`command/NOTES.md`'s `adopt-structure` entry: `PoolElementStructurePiece` does expose
+enough (`getPosition()`, `getRotation()`) to do exact position + rotation transforms
+for single-piece jigsaw structures, which is what `adoptStructure` uses instead of
+content-only matching. Content-only matching remains the right tool specifically when
+you don't already know which structure (if any) you're standing in.
+
+**`storageWrapper.renderInfo` is deliberately never read.** That's Sophisticated
+Storage's external display-item metadata (what floats on the outside of the block),
+not real inventory contents. An earlier offline extraction pass for the ground-truth
+JSON mistakenly included it, inflating a small number of "limited barrel"
+fingerprints by one phantom item — verified by comparing the extraction against the
+actual live container API. The runtime match against `CompatInventory.get(slot)` is
+also clean (it only reads real inventory slots), so both sides of the comparison are
+correct.
+
+**Known limitation.** Content-only matching (`matchesKnownFingerprint`) cannot rule
+out a player who: (a) builds their own Sophisticated Storage inside a generated
+structure's bounding box AND (b) happens to store the exact same items, in the exact
+same slots, as a known fingerprint. Accepted as residual risk — far narrower than the
+pre-0.3.1 bug, and `adopt-structure`'s position-based path (see `command/NOTES.md`)
+doesn't share this weakness at all, since it never relies on contents to decide
+*where* to look.
+
+## ContainerFingerprintFilter.java
+
+Simple block-id filter used only at fingerprint-scan time to identify which palette
+entries in a structure template are Sophisticated Storage or CobbleFurnies storage
+blocks (as opposed to CobbleFurnies decorative furniture with no inventory). The
+live-world path in `ContainerCompatibility` identifies real containers by their
+actual block entity class/API shape instead, which is a stronger signal at runtime.
+
+## StructurePlacement.java
+
+`resolveTemplateId(PoolElementStructurePiece)` / `parseTemplateId(String)`, moved out of
+`ChestShareCommands` so `adopt-structure` and `StructureContainerRestorer` agree on which template a
+piece came from. Behavior is unchanged (Either-typed field by reflection, then the first
+`namespace:path` token of `toString()`); the only addition is a per-class cache of the reflected
+fields, because the passive scan asks for the same few element classes over and over.
+
+## StructureStorageBlock: `blockId` and `multiPalette`
+
+Added for the passive restore. `blockId` is the block the template places at that position (first
+palette), so the restore can require the live block to be the same block. `multiPalette` is true when
+the template has more than one palette: only the first is recorded, and the others may place a
+different block or different baked contents at the same position, so a multi-palette block is left to
+`adopt-structure`. Neither field takes part in `adopt-structure`'s "are these two layouts
+interchangeable" test (`sameContents` compares positions, items and loot tables only), so its
+ambiguity behavior is exactly what it was.
