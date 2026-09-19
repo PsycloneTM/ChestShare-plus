@@ -33,6 +33,21 @@ If you don't need any of the changes below, use the original
   chunk that merely loads for the first time under this mod. This means
   installing the mod on an existing world will never sweep up a player's
   own already-placed modded storage.
+- **Structure fingerprint registry** — at server start, every registered
+  structure template (vanilla, datapack, and mod-provided) is scanned and
+  its baked-in storage containers are recorded. This lets containers that
+  came from a structure — Sophisticated Storage / CobbleFurnies containers,
+  and loot-table containers like Cobblemon's Gilded Chest — be recognized
+  and shared even on a chunk that existed before the mod was installed.
+- **`/chestshare adopt-structure <pos>`** — adopts every storage container
+  in the structure at `<pos>` and restores each one's original loot from
+  the template, whatever it currently holds. Covers containers that were
+  already looted, emptied, or previously shared with the wrong contents.
+- **`/chestshare toggle restore-empty-structures`** — optional, off by
+  default. When enabled, an empty container sitting at a known structure
+  storage position is automatically refilled and made a shared container
+  the next time its chunk loads — including an already-explored chunk
+  being revisited — without needing `adopt-structure` run by hand.
 
 ## Commands (op level 2)
 
