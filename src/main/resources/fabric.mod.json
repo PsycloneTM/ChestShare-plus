@@ -10,7 +10,7 @@
   ],
   "license": "MIT",
   "icon": "assets/chestshare/icon.png",
-  "environment": "*",
+  "environment": "server",
   "entrypoints": {
     "main": [
       "dev.chestshare.ChestShare"
