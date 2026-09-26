@@ -4,6 +4,146 @@ All notable changes to ChestShare+ are documented here. This fork's own
 version numbers only — see [README.md](README.md) for what ChestShare+ adds
 on top of Calamech's original [ChestShare](https://modrinth.com/mod/chestshare).
 
+## 0.3.3
+
+### Fixed
+
+- **A shared container's saved per-player data grew forever, with nothing
+  ever removing an old entry.** Every player who opened a given shared
+  container kept a permanent record of their roll in that world's save
+  data, even once they had taken everything and had nothing left to lose by
+  rolling fresh next time. On a server with many players and many shared
+  containers over time, this is unbounded growth with no natural ceiling.
+  An all-empty entry — a player who legitimately took everything, or the
+  rare case of a roll that should have had loot but didn't — is now dropped
+  the moment the container is closed in that state, and that player rolls
+  fresh from the template on their next visit.
+
+- **Critical: `Container`-based compat blocks (Carved Wood, Handcrafted, and
+  similar) could be silently converted into shared containers the first time
+  a player opened their own freshly-placed one.** This is a second instance
+  of the bug already fixed in 0.3.1 for Sophisticated Storage — found later
+  because it lived in a different code path (`resolveGenericEntry`, used for
+  modded blocks that implement vanilla's own `Container` interface, rather
+  than the reflective path Sophisticated Storage uses). Registration for
+  these containers now only ever happens through the passive,
+  `freshlyGenerated`-gated scan; opening one only ever displays an
+  already-registered shared container.
+
+- **Structure scanning could silently fail to record some legitimate
+  megastructures**, including all four regional leagues, `team_galactic_hq`,
+  `stark_mountain`, `secret_garden`, `sky_pillar`, `newmoon_island`, and
+  `fullmoon_island` — several failing to parse by only tens of bytes. The NBT
+  read used a 64 MiB allocation cap borrowed as a generic safe default,
+  without checking it against real structure sizes; both the structure
+  fingerprint scan and `/chestshare import` now read without a cap, since
+  both only ever read files the server admin already chose to run (bundled
+  structure files, or ChestShare+'s own export files) — there's no untrusted
+  network input to guard against here the way vanilla's own cap exists for.
+
+- **A container already correctly shared from a structure could be
+  needlessly rebuilt**, discarding a player's current progress looting it,
+  purely because its `SharedMarker` flag or structure-provenance record had
+  drifted out of sync with `SharedContainersState` (e.g. after a block
+  entity reload). The passive chunk scan now leaves every container that is
+  already registered completely alone: it never rebuilds one from its
+  structure template, and it does no repairing of any kind (no marker
+  re-sync, no provenance stamping). `SharedContainerEntry` records which
+  structure template a structure-derived registration came from, persisted
+  across restarts, and that record is written once, when the entry is
+  created.
+
+- **Critical: newly-shared vanilla-style containers could silently fail to
+  persist across a restart.** A missing `state.setDirty()` call after
+  writing a new registration meant the write only ever updated
+  `SharedContainersState`'s in-memory copy — it looked completely successful
+  for the rest of that session (the container opened correctly, and
+  re-running the same command recognized it as already shared), but was
+  never actually saved to disk. On the next reload of that data (most
+  commonly a server restart), the registration was simply gone, and
+  whatever registered it — the passive scanner, `/chestshare convert`,
+  `/chestshare import`, or `/chestshare adopt-structure` — would do so
+  again, discarding the previous per-player state. This affected any
+  vanilla-style container (including loot-table-based ones like Cobblemon's
+  Gilded Chest) registered through the shared `ContainerRegistrar` write
+  path, plus the modded/compat branches of `convert` and `import`
+  specifically. Every write path in the codebase now correctly marks the
+  state dirty.
+
+- **Critical: a just-registered shared container could be silently deleted the
+  very next time it was opened, even within the same server session.** Four
+  places that resolve a shared container on open used to treat "the block
+  entity's own cached flag disagrees with `SharedContainersState`" as "this
+  entry must be stale garbage," and deleted the real, correct entry to match
+  the flag. That flag is a cheap, on-block cache of one bit of the real data
+  in `SharedContainersState`, not a second source of truth — it can and does
+  desync for ordinary reasons (most commonly a block entity getting a fresh
+  Java object instance across a chunk reload), and the fix now trusts the
+  actual data and repairs the flag to match it, rather than the reverse.
+  This is what caused a real reported case: `/chestshare adopt-structure`
+  correctly restored a Cobblemon Gilded Chest, but the entry was deleted the
+  moment a player opened it, so every subsequent run of the command reported
+  "restored" again, forever, with no restart involved.
+
+- **A confirmed, genuine mismatch between a shared container's stored
+  contents and its structure template could still silently fail to restore.**
+  Two separate issues combined to produce this: first, the check used to
+  decide whether an already-shared container's contents were correct compared
+  the stored (already slot-normalized) entry against the raw baked item list
+  directly, so any normalization difference between the two representations
+  made them permanently disagree even when the actual contents matched —
+  fixed by running both sides through the same normalization pass before
+  comparing. Second, once a mismatch was correctly confirmed as genuine, the
+  actual restore was calling the same write method used for a first-time
+  registration, which refuses on purpose to overwrite a container that's
+  already registered — so the restore silently no-opped instead of running.
+  `/chestshare adopt-structure` now uses a separate, explicitly-guarded write
+  path for this one case; every other registration path is unaffected and
+  keeps the original protection against overwriting real shared state.
+
+- **Critical: opening a double chest made of a shared chest and an ordinary
+  chest failed with an exception.** Placing a new, empty chest next to a shared
+  loot or structure chest (very ordinary — e.g. beside a village or dungeon
+  chest) and opening the resulting double chest threw a `NullPointerException`
+  on the server instead of opening. The double-chest hook force-registered the
+  ordinary half so it would have something to hand to the menu builder, but an
+  empty chest with no loot table has nothing to capture, so no entry was created
+  and the missing one was passed straight through.
+
+- **Critical: a player's own chest joined to a shared chest was converted into
+  a shared container.** That same force-registration, when the ordinary half
+  was *not* empty, captured its contents as a template, emptied the real chest,
+  and gave every other player who opened it their own copy of those items —
+  sweeping up a player's own storage, which ChestShare+ is meant never to do.
+  The ordinary half of a double chest is now never registered or touched. The
+  menu shows the shared half from the opening player's own copy next to the
+  ordinary half's real, live inventory, in the same slot order as an all-shared
+  double chest, and the ordinary half's contents are seen identically by
+  everyone.
+
+- **The world-gen safety gate could be defeated across dimensions.** The set of
+  freshly generated chunks was keyed by chunk position alone, but every
+  dimension uses the same chunk coordinates (the spawn area exists in all of
+  them, as does anything reached through a portal at matching coordinates). A
+  chunk freshly generated in one dimension could therefore be "consumed" by a
+  different, already-existing chunk loading at the same coordinates in another
+  dimension: the old chunk was then scanned as if it were new — the exact case
+  the gate exists to rule out, and what stops installing the mod on an
+  existing world from sweeping up players' own modded storage — while the
+  genuinely new chunk lost its flag. The set is now keyed by dimension as well
+  as chunk position.
+
+### Changed
+
+- **Sophisticated Storage and CobbleFurnies reflection is now resolved once per
+  block-entity class instead of on every scan and right-click.** Which methods
+  and fields to call is a fact about the class, so it is cached after the first
+  successful lookup; slot counts and contents are still read fresh from every
+  container (two barrels of the same block can have different slot counts), and
+  a cached entry that doesn't work for a particular container falls back to the
+  full search rather than being trusted. Failed lookups are never cached, since
+  some failures are timing-dependent per container.
+
 ## 0.3.2
 
 Adds a structure fingerprint registry and `/chestshare adopt-structure`, so
@@ -86,6 +226,17 @@ loot with their original contents.
     second line explaining how the structure was resolved appears only when
     something was left unhandled. Per-container detail is logged at DEBUG, so a
     normal run adds one line to the server log.
+
+### Fixed
+
+- **Startup log spam:** every block entity that isn't a Sophisticated Storage block (waystones,
+  Cozy Home lamps/chimneys/clocks, Cobblemon PCs and healing machines, PokeBlocks plush, trainer
+  spawners, ...) logged `[ChestShare] '<class>' has no getStorageWrapper() method ... Sophisticated
+  Storage compat does not apply to this block entity.` once per class. That is the expected state
+  for anything that isn't Sophisticated Storage, so it is no longer logged; the warning is kept
+  only for Sophisticated Storage's own classes, where a missing method would be a real problem.
+- The `getStorageWrapper()` reflection lookup is now cached per class, so it no longer re-walks a
+  block entity's superclass chain on every chunk load and right-click.
 
 ## 0.3.1
 

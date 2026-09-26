@@ -36,8 +36,15 @@ public class ChestShare implements ModInitializer {
 
     private static final Queue<ScanRequest> PENDING_SCANS = new ConcurrentLinkedQueue<>();
     private static final java.util.concurrent.atomic.AtomicInteger PENDING_COUNT = new java.util.concurrent.atomic.AtomicInteger();
-    // See NOTES.md: FRESHLY_GENERATED_CHUNKS
-    private static final java.util.Set<Long> FRESHLY_GENERATED_CHUNKS =
+    // See NOTES.md: FRESHLY_GENERATED_CHUNKS. Keyed by (dimension, chunk pos) - NOT chunk pos
+    // alone. ChunkPos.toLong() only encodes x/z, and different dimensions routinely share the
+    // same chunk coordinates (spawn in every dimension, any chunk visited via a portal at the
+    // same x/z). A bare Set<Long> shared across all dimensions let a chunk freshly generated in
+    // one dimension get "consumed" by an unrelated, pre-existing chunk loading at the same
+    // coordinates in a different dimension - defeating the passive world-gen safety gate this
+    // set exists to implement (see ContainerScanner/ContainerCompatibility NOTES.md).
+    private record ChunkKey(net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension, long chunkPos) {}
+    private static final java.util.Set<ChunkKey> FRESHLY_GENERATED_CHUNKS =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
 
     private record ScanRequest(net.minecraft.server.level.ServerLevel world, LevelChunk chunk) {}
@@ -48,7 +55,7 @@ public class ChestShare implements ModInitializer {
 
         // See NOTES.md: CHUNK_GENERATE registration
         ServerChunkEvents.CHUNK_GENERATE.register((world, chunk) -> {
-            FRESHLY_GENERATED_CHUNKS.add(chunk.getPos().toLong());
+            FRESHLY_GENERATED_CHUNKS.add(new ChunkKey(world.dimension(), chunk.getPos().toLong()));
         });
 
         ServerLifecycleEvents.SERVER_STARTED.register(server ->
@@ -72,7 +79,8 @@ public class ChestShare implements ModInitializer {
                     LevelChunk loaded = request.world().getChunkSource().getChunkNow(
                             request.chunk().getPos().x, request.chunk().getPos().z);
                     if (loaded == request.chunk()) {
-                        boolean freshlyGenerated = FRESHLY_GENERATED_CHUNKS.remove(request.chunk().getPos().toLong());
+                        boolean freshlyGenerated = FRESHLY_GENERATED_CHUNKS.remove(
+                                new ChunkKey(request.world().dimension(), request.chunk().getPos().toLong()));
                         ContainerScanner.scanChunk(request.world(), request.chunk(), freshlyGenerated);
                     }
                 } catch (Throwable t) {

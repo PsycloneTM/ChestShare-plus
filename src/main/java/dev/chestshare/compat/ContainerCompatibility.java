@@ -17,7 +17,10 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Optional compatibility for storage block entities which do not implement vanilla Container. */
 public final class ContainerCompatibility {
@@ -25,6 +28,12 @@ public final class ContainerCompatibility {
 
     private static final Logger LOGGER = ChestShare.LOGGER;
     private static final Set<String> WARNED_CLASSES = new HashSet<>();
+
+    /** Per-class result of the getStorageWrapper() lookup, including the negative result.
+     *  Almost every block entity in a modpack is not a Sophisticated Storage block, and this
+     *  lookup runs for each one on every chunk load and every right-click, so the (reflective,
+     *  superclass-walking) search is done once per class. See NOTES.md. */
+    private static final Map<Class<?>, Optional<Method>> WRAPPER_METHODS = new ConcurrentHashMap<>();
 
     public static boolean isSupportedContainer(BlockEntity be) {
         if (be == null || be.getClass().getName().startsWith("net.minecraft.")) return false;
@@ -85,6 +94,11 @@ public final class ContainerCompatibility {
      */
     public static SharedContainerEntry registerWithItems(ServerLevel world, BlockEntity be,
             List<FingerprintRegistry.FingerprintItem> bakedItems, boolean markDirty) {
+        return registerWithItems(world, be, bakedItems, markDirty, null);
+    }
+
+    public static SharedContainerEntry registerWithItems(ServerLevel world, BlockEntity be,
+            List<FingerprintRegistry.FingerprintItem> bakedItems, boolean markDirty, ResourceLocation structureTemplate) {
         if (!(be instanceof SharedMarker marker)) return null;
         CompatInventory inv = getContainerInventory(be);
         if (inv == null || inv.size() <= 0) return null;
@@ -97,7 +111,7 @@ public final class ContainerCompatibility {
         if (markDirty) be.setChanged();
 
         SharedContainerEntry entry = new SharedContainerEntry(
-                new ContainerTemplate.ItemListTemplate(stacks, inv.size()));
+                new ContainerTemplate.ItemListTemplate(stacks, inv.size()), structureTemplate);
         SharedContainersState state = SharedContainersState.get(world);
         state.putBlock(be.getBlockPos(), entry);
         state.setDirty();
@@ -145,6 +159,11 @@ public final class ContainerCompatibility {
      */
     public static SharedContainerEntry registerWithLootTable(ServerLevel world, BlockEntity be,
             ResourceLocation lootTable, long seed, boolean markDirty) {
+        return registerWithLootTable(world, be, lootTable, seed, markDirty, null);
+    }
+
+    public static SharedContainerEntry registerWithLootTable(ServerLevel world, BlockEntity be,
+            ResourceLocation lootTable, long seed, boolean markDirty, ResourceLocation structureTemplate) {
         if (!(be instanceof SharedMarker marker) || lootTable == null) return null;
         CompatInventory inv = getContainerInventory(be);
         if (inv == null || inv.size() <= 0) return null;
@@ -154,7 +173,7 @@ public final class ContainerCompatibility {
         if (markDirty) be.setChanged();
 
         SharedContainerEntry entry = new SharedContainerEntry(
-                new ContainerTemplate.LootTableTemplate(lootTable, seed, inv.size()));
+                new ContainerTemplate.LootTableTemplate(lootTable, seed, inv.size()), structureTemplate);
         SharedContainersState state = SharedContainersState.get(world);
         state.putBlock(be.getBlockPos(), entry);
         state.setDirty();
@@ -209,15 +228,120 @@ public final class ContainerCompatibility {
         public void set(int slot, ItemStack stack) { h.set(slot, stack); }
     }
 
+    /** Reusable recipe for rebuilding a reflective {@link Handler} for any block entity of a
+     *  given class, without repeating the (expensive, hierarchy-walking) method/field lookups
+     *  {@link #resolveHandler} had to do the first time it ever saw that class. Only Methods and
+     *  Fields are stored here, never a live target object or a resolved value: which methods
+     *  exist and what they're declared to return is a fact about the CLASS, invariant across
+     *  every instance, but the actual slot count and current contents are per-instance and must
+     *  always be read fresh - Sophisticated Storage's slot count in particular can differ
+     *  between two placed barrels of the exact same block if their storage upgrades differ, so
+     *  it would be wrong to cache the resolved int itself. See NOTES.md. */
+    private sealed interface HandlerRecipe {
+        /** Rebuilds a Handler for this specific block-entity instance using only the Methods/
+         *  Fields already resolved for its class, or null if invoking them on this particular
+         *  instance didn't work out (e.g. a transient null mid-initialization) - callers fall
+         *  back to the full uncached search in that case rather than trusting a stale recipe. */
+        Handler build(BlockEntity be);
+
+        record Sophisticated(Method wrapperMethod, Method invMethod, Method wrapperSlotsMethod,
+                              Method invSlotCountMethod, Method getMethod, Method setMethod) implements HandlerRecipe {
+            public Handler build(BlockEntity be) {
+                try {
+                    Object storageWrapper = wrapperMethod.invoke(be);
+                    if (storageWrapper == null) return null;
+                    Object inv = invMethod.invoke(storageWrapper);
+                    if (inv == null) return null;
+                    // get/set are only invoked lazily (and Handler swallows their exceptions), so a
+                    // handler of an unexpected class would otherwise read as empty and silently drop
+                    // writes. Reject it here so the caller falls back to the full search instead.
+                    if (!getMethod.getDeclaringClass().isInstance(inv)
+                            || !setMethod.getDeclaringClass().isInstance(inv)) return null;
+                    int slots = 0;
+                    if (wrapperSlotsMethod != null) {
+                        Object v = wrapperSlotsMethod.invoke(storageWrapper);
+                        if (v instanceof Number n) slots = n.intValue();
+                    }
+                    if (slots <= 0 && invSlotCountMethod != null) {
+                        Object v = invSlotCountMethod.invoke(inv);
+                        if (v instanceof Number n) slots = n.intValue();
+                    }
+                    if (slots <= 0) return null;
+                    return new Handler(inv, slots, getMethod, setMethod, null, null);
+                } catch (Throwable t) {
+                    return null;
+                }
+            }
+        }
+
+        record CobbleFurniesList(Method listMethod, Method sizeMethod) implements HandlerRecipe {
+            public Handler build(BlockEntity be) {
+                try {
+                    Object value = listMethod.invoke(be);
+                    if (!(value instanceof List<?>)) return null;
+                    Object sizeValue = sizeMethod.invoke(be);
+                    if (!(sizeValue instanceof Number n)) return null;
+                    return new Handler(be, n.intValue(), null, null, listMethod, null);
+                } catch (Throwable t) {
+                    return null;
+                }
+            }
+        }
+
+        record CobbleFurniesField(Field itemsField, Method sizeMethod) implements HandlerRecipe {
+            public Handler build(BlockEntity be) {
+                try {
+                    Object value = itemsField.get(be);
+                    if (!(value instanceof List<?> list)) return null;
+                    int slots;
+                    if (sizeMethod == null) {
+                        slots = list.size();
+                    } else {
+                        Object sizeValue = sizeMethod.invoke(be);
+                        if (!(sizeValue instanceof Number n)) return null;
+                        slots = n.intValue();
+                    }
+                    return new Handler(be, slots, null, null, null, itemsField);
+                } catch (Throwable t) {
+                    return null;
+                }
+            }
+        }
+    }
+
+    /** Per-class cache of a successfully-resolved {@link HandlerRecipe}. Populated only from a
+     *  successful {@link #resolveHandler} call, never with a negative result: a container that
+     *  fails to resolve (missing storage wrapper this instant, no matching methods on this
+     *  attempt, etc.) always retries the full search next time, since some of those failures
+     *  can be transient per-instance timing rather than a durable fact about the class. */
+    private static final Map<Class<?>, HandlerRecipe> HANDLER_RECIPES = new ConcurrentHashMap<>();
+
     private static Handler findHandler(BlockEntity be) {
+        HandlerRecipe recipe = HANDLER_RECIPES.get(be.getClass());
+        if (recipe != null) {
+            Handler h = recipe.build(be);
+            if (h != null) return h;
+            // Cached recipe didn't pan out for this particular instance (see the class javadoc
+            // above) - fall through to the full search below rather than reporting "no handler".
+        }
+        return resolveHandler(be);
+    }
+
+    private static Handler resolveHandler(BlockEntity be) {
         // Sophisticated Storage reflection lookup - see NOTES.md for the full history
         // of why this walks method names this way (three earlier silent-failure bugs).
         try {
-            Method wrapper = publicOrDeclaredMethod(be.getClass(), "getStorageWrapper");
+            Method wrapper = storageWrapperMethod(be.getClass());
             if (wrapper == null) {
-                warnOnce(be, "has no getStorageWrapper() method (tried public API and full "
-                        + "declared-method superclass walk) — Sophisticated Storage compat "
-                        + "does not apply to this block entity.");
+                // Not having getStorageWrapper() is the normal case for every block entity that
+                // isn't Sophisticated Storage (waystones, chimneys, statues, ...), so it is only
+                // worth a warning for a class that really is a Sophisticated* one - there it means
+                // a Sophisticated Storage update renamed the method. See NOTES.md.
+                if (isSophisticatedClass(be.getClass())) {
+                    warnOnce(be, "has no getStorageWrapper() method (tried public API and full "
+                            + "declared-method superclass walk) — Sophisticated Storage compat "
+                            + "does not apply to this block entity.");
+                }
             } else {
                 Object storageWrapper = wrapper.invoke(be);
                 if (storageWrapper == null) {
@@ -235,15 +359,17 @@ public final class ContainerCompatibility {
                         } else {
                             int slots = 0;
                             Method wrapperSlots = findMethod(storageWrapper.getClass(), 0, "getNumberOfInventorySlots");
+                            Method workingWrapperSlots = null;
                             if (wrapperSlots != null) {
                                 try {
                                     Object v = wrapperSlots.invoke(storageWrapper);
-                                    if (v instanceof Number n) slots = n.intValue();
+                                    if (v instanceof Number n) { slots = n.intValue(); workingWrapperSlots = wrapperSlots; }
                                 } catch (Throwable t) {
                                     warnOnce(be, "storage wrapper '" + storageWrapper.getClass().getName()
                                             + "' getNumberOfInventorySlots() invoke failed: " + t);
                                 }
                             }
+                            Method workingInvSlotCount = null;
                             if (slots <= 0) {
                                 for (String name : new String[]{"getSlotCount", "getSlots", "getNumberOfInventorySlots", "size"}) {
                                     Method candidate = findMethod(inv.getClass(), 0, name);
@@ -252,6 +378,7 @@ public final class ContainerCompatibility {
                                         Object v = candidate.invoke(inv);
                                         if (v instanceof Number n) {
                                             slots = n.intValue();
+                                            workingInvSlotCount = candidate;
                                             break;
                                         }
                                     } catch (Throwable t) {
@@ -267,6 +394,8 @@ public final class ContainerCompatibility {
                                 Method set = findMethod(inv.getClass(), 2,
                                         "setStackInSlot", "setSlotStack", "setStack", "setItem");
                                 if (get != null && set != null) {
+                                    HANDLER_RECIPES.put(be.getClass(), new HandlerRecipe.Sophisticated(
+                                            wrapper, invMethod, workingWrapperSlots, workingInvSlotCount, get, set));
                                     return new Handler(inv, slots, get, set, null, null);
                                 } else {
                                     warnOnce(be, "found inventory handler '" + inv.getClass().getName()
@@ -299,6 +428,7 @@ public final class ContainerCompatibility {
                     Object value = list.invoke(be);
                     if (value instanceof List<?>) {
                         int slots = ((Number) size.invoke(be)).intValue();
+                        HANDLER_RECIPES.put(be.getClass(), new HandlerRecipe.CobbleFurniesList(list, size));
                         return new Handler(be, slots, null, null, list, null);
                     }
                 }
@@ -309,6 +439,7 @@ public final class ContainerCompatibility {
                     if (value instanceof List<?>) {
                         Method sizeMethod = findMethod(be.getClass(), "getContainerSize", "method_5439");
                         int slots = sizeMethod == null ? ((List<?>) value).size() : ((Number) sizeMethod.invoke(be)).intValue();
+                        HANDLER_RECIPES.put(be.getClass(), new HandlerRecipe.CobbleFurniesField(items, sizeMethod));
                         return new Handler(be, slots, null, null, null, items);
                     }
                 }
@@ -327,6 +458,31 @@ public final class ContainerCompatibility {
         }
 
         return null;
+    }
+
+    /** Cached getStorageWrapper() lookup for a block-entity class; null if it has none. A lookup
+     *  that throws (e.g. NoClassDefFoundError from a method signature naming a client-only class
+     *  on a dedicated server) is cached as "none" too, so it is attempted once per class rather
+     *  than on every chunk load. */
+    private static Method storageWrapperMethod(Class<?> type) {
+        return WRAPPER_METHODS.computeIfAbsent(type, t -> {
+            try {
+                return Optional.ofNullable(publicOrDeclaredMethod(t, "getStorageWrapper"));
+            } catch (Throwable e) {
+                if (isSophisticatedClass(t)) {
+                    LOGGER.warn("[ChestShare] '{}' getStorageWrapper() lookup threw {}: {}",
+                            t.getName(), e.getClass().getName(), e.getMessage());
+                } else {
+                    LOGGER.debug("[ChestShare] '{}' could not be inspected for getStorageWrapper(): {}",
+                            t.getName(), e.toString());
+                }
+                return Optional.empty();
+            }
+        }).orElse(null);
+    }
+
+    private static boolean isSophisticatedClass(Class<?> type) {
+        return type.getName().startsWith("net.p3pp3rf1y.sophisticated");
     }
 
     private static Method publicOrDeclaredMethod(Class<?> type, String name, Class<?>... params) {

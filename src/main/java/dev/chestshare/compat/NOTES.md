@@ -71,6 +71,28 @@ fallback loop) is deliberate: a failure there must not propagate up into
 `findHandler`'s top-level catch, which would silently drop the whole lookup
 instead of trying the next candidate name.
 
+### `findHandler()` — a missing `getStorageWrapper()` is only news for a Sophisticated class
+
+The "has no getStorageWrapper() method" warning used to fire for **every** block-entity class
+that reached `findHandler` without being a vanilla `Container` — which in a modpack is nearly
+all of them (waystones, chimneys, lamps, wall clocks, statues, PC/healing machines, plush
+"pokedolls", trainer spawners, berry blocks...). A real server log showed ~25 of these lines at
+startup, each one a false alarm: the method is *supposed* to be absent on anything that isn't
+Sophisticated Storage. The warning exists so a working run is distinguishable from a silently
+broken one (see the three failed 0.3.x attempts above), so it is now emitted only when the class
+name starts with `net.p3pp3rf1y.sophisticated` — there, a missing method really would mean a
+Sophisticated Storage update renamed it. Every other miss is silent.
+
+The lookup itself is now cached per class (`WRAPPER_METHODS`, negative results included). It runs
+for each block entity on every chunk load and every right-click, and the miss path is the
+expensive one (`getMethod` plus a `getDeclaredMethods()` walk up the whole superclass chain). A
+lookup that *throws* is cached as "none" as well — on a dedicated server, reflecting over a class
+whose method signatures name a client-only class raises `NoClassDefFoundError`, and retrying that
+on every chunk load just repeated the noise. (That is also the likely source of stray
+`Error loading class: net/minecraft/class_...` lines interleaved with these warnings: they come
+from the loader while ChestShare reflects over a foreign block-entity class, not from ChestShare
+touching a client class on purpose.)
+
 ### `findMethod(Class<?>, int paramCount, String... names)`
 
 Like the simpler `findMethod` overload, but only matches methods with the given
@@ -92,6 +114,41 @@ accessibility, not just the method's own public modifier. Without this,
 every `invoke()` threw, and that exception propagated up into `findHandler`'s
 top-level catch, silently discarding the whole Sophisticated Storage lookup with
 nothing logged.
+
+### `findHandler()` / `resolveHandler()` — per-class `HandlerRecipe` cache
+
+`findHandler` is a thin wrapper: if `HANDLER_RECIPES` has a recipe for the block entity's
+class, `recipe.build(be)` rebuilds a `Handler` from it; if there is no recipe, or `build`
+returns `null`, it falls through to `resolveHandler`, which is the full uncached search
+described above and stores a recipe on every successful branch (Sophisticated Storage,
+CobbleFurnies via `getItems()`, CobbleFurnies via the `items` field).
+
+**Only `Method`/`Field` objects are cached - never a slot count, a target object, or any
+resolved value.** Which methods exist is a fact about the class; the slot count is not.
+Two Sophisticated Storage barrels of the same block can have different slot counts if their
+upgrades differ, so `build` reads the count fresh from each instance.
+
+**Failures are never cached.** A wrapper that is `null` this instant, or a zero slot
+count, can be per-instance timing (e.g. a block entity mid-initialization) rather than a
+durable fact about the class, so those cases retry the full search next time. A cached
+recipe that returns `null` for one instance is not evicted either - it just falls through
+for that instance.
+
+**`Sophisticated.build` checks `getMethod`/`setMethod` `.getDeclaringClass().isInstance(inv)`.**
+The get/set `Method`s were resolved against one instance's inventory-handler class, but are
+only invoked lazily, and `Handler.get`/`set` swallow every exception. If a later instance
+of the same block-entity class ever returned an inventory handler of a different class,
+the cached methods would fail to invoke and the container would read as empty and silently
+drop writes. This was found by test, not in production; rejecting it in `build` makes the
+caller fall back to the full search, which is what the uncached code did.
+
+Measured against stand-in classes (not the real mods): roughly 330 ns down to 38 ns per
+`isSupportedContainer` call for a supported container. Block entities that are not storage
+were already cheap (~15 ns, thanks to `WRAPPER_METHODS`) and are unchanged.
+
+Not cached: a CobbleFurnies-package class that has neither `getItems()` nor an `items` field
+re-walks its class hierarchy on every call. Only classes in that mod's package reach that
+branch, so this was left alone.
 
 ### Other notes
 
@@ -211,3 +268,18 @@ different block or different baked contents at the same position, so a multi-pal
 `adopt-structure`. Neither field takes part in `adopt-structure`'s "are these two layouts
 interchangeable" test (`sameContents` compares positions, items and loot tables only), so its
 ambiguity behavior is exactly what it was.
+
+## NbtAccounter cap (fixed after real server logs)
+
+The original `readCompressed` calls (here and in `ChestShareCommands.importContainers`)
+used `new NbtAccounter(64L * 1024L * 1024L, 16)` - a 64 MiB allocation cap borrowed from
+a "safe default" without checking it against real structure sizes. In production this
+silently dropped several real Cobbleverse structures out of the fingerprint database:
+all four regional leagues, `team_galactic_hq`, `stark_mountain`, `secret_garden`,
+`sky_pillar`, `newmoon_island`, and `fullmoon_island` - all legitimate megastructures,
+several failing by only tens of bytes over the cap. Both call sites now use
+`NbtAccounter.unlimitedHeap()`. The cap exists in vanilla to guard against hostile
+input (e.g. an oversized network payload); it buys nothing here, since both call sites
+only ever read files the server admin already chose to run (bundled mod/datapack
+structure files, or ChestShare's own export files) - there's no untrusted party in
+this path to guard against.

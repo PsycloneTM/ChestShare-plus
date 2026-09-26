@@ -105,7 +105,18 @@ public final class FingerprintRegistry {
             ResourceLocation structureId = ResourceLocation.fromNamespaceAndPath(resourceLoc.getNamespace(), rel);
 
             try (InputStream in = resource.open()) {
-                CompoundTag root = NbtIo.readCompressed(in, new NbtAccounter(64L * 1024L * 1024L, 16));
+                // NbtAccounter caps how much a single NBT read is allowed to allocate, as a
+                // safeguard against hostile/oversized input (e.g. a malicious network payload).
+                // These files are trusted local resources (mod jars and server datapacks the
+                // admin already chose to run), not untrusted input, and several real Cobbleverse
+                // structures (the four regional leagues, team_galactic_hq, stark_mountain,
+                // secret_garden, sky_pillar, newmoon_island, fullmoon_island) are legitimately
+                // multi-hundred-thousand-block megastructures that blew straight through the
+                // previous 64 MiB cap ("tried to allocate: 67108838 + 48 bytes where max
+                // allowed: 67108864" - i.e. failing by mere bytes on some of them). Unlimited is
+                // the right call for the same reason vanilla itself doesn't cap structure-file
+                // reads from its own data sources.
+                CompoundTag root = NbtIo.readCompressed(in, NbtAccounter.unlimitedHeap());
                 structuresScanned++;
                 List<StructureStorageBlock> blockList = new ArrayList<>();
                 scanStructureNbt(root, fingerprints, blockList);

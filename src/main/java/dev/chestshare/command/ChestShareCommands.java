@@ -119,7 +119,9 @@ public final class ChestShareCommands {
             for(int s=0;s<inv.size();s++){inv.set(s, ItemStack.EMPTY);}
             if(be instanceof SharedMarker marker) marker.chestshare$setShared(true);
             be.setChanged();
-            SharedContainersState.get(world).putBlock(pos, new SharedContainerEntry(template));
+            SharedContainersState convertState=SharedContainersState.get(world);
+            convertState.putBlock(pos, new SharedContainerEntry(template));
+            convertState.setDirty();
             source.sendSuccess(()->Component.literal("Converted container at "+coordString(pos)+" to shared loot "+id+" (previous contents discarded)"),true); return 1;
         }
         source.sendFailure(Component.literal("No lootable container at "+coordString(pos))); return 0;
@@ -150,7 +152,10 @@ public final class ChestShareCommands {
     }
     private static int importContainers(CommandSourceStack source,String fileName,boolean force,int parallel){
         Path path=resolveDataFile(source.getServer(),fileName);if(path==null){source.sendFailure(Component.literal("Invalid file name (plain name only, no path)"));return 0;}
-        CompoundTag root;try{root=NbtIo.readCompressed(path,new net.minecraft.nbt.NbtAccounter(64L*1024L*1024L, 16));}catch(IOException e){source.sendFailure(Component.literal("Import failed: "+e.getMessage()));return 0;}
+        // Same cap-too-small issue as the fingerprint scan (see FingerprintRegistry.NOTES.md) -
+        // this is ChestShare's own trusted export file, not untrusted network input, and a
+        // server with enough shared containers can produce one bigger than 64 MiB.
+        CompoundTag root;try{root=NbtIo.readCompressed(path,net.minecraft.nbt.NbtAccounter.unlimitedHeap());}catch(IOException e){source.sendFailure(Component.literal("Import failed: "+e.getMessage()));return 0;}
         if(ImportJob.ACTIVE!=null){source.sendFailure(Component.literal("An import is already running"));return 0;}
 
         Map<ServerLevel,Map<Long,List<ImportJob.PendingPos>>> byChunk=new LinkedHashMap<>();
@@ -385,14 +390,23 @@ public final class ChestShareCommands {
                 // given player - the determinism rule convert() follows. See NOTES.md.
                 SharedContainerEntry registered;
                 if (be instanceof RandomizableContainerBlockEntity randomizable) {
-                    registered = randomizable.getLootTable() != null
-                            // Still holds its own loot table (never opened): that IS the placed
-                            // state, so it beats the template's copy of it, which a datapack or
-                            // a structure processor could have diverged from since generation.
-                            ? ContainerRegistrar.register(world, randomizable, true)
-                            : ContainerRegistrar.applyTemplate(world, randomizable,
-                                    new ContainerTemplate.LootTableTemplate(tableId, block.lootTableSeed(),
-                                            randomizable.getContainerSize()), true);
+                    if (randomizable.getLootTable() != null) {
+                        // Still holds its own loot table (never opened): that IS the placed
+                        // state, so it beats the template's copy of it, which a datapack or
+                        // a structure processor could have diverged from since generation.
+                        registered = ContainerRegistrar.register(world, randomizable, true);
+                    } else {
+                        // Same gap as the baked-items branch above: existing != null here means
+                        // wasShared was true and the ID check at the top of this branch already
+                        // ruled out "already correct", so this is a genuine mismatch - the plain
+                        // applyTemplate would silently refuse to overwrite it. See
+                        // ContainerRegistrar's javadoc and command/NOTES.md.
+                        ContainerTemplate.LootTableTemplate rebuilt = new ContainerTemplate.LootTableTemplate(
+                                tableId, block.lootTableSeed(), randomizable.getContainerSize());
+                        registered = wasShared
+                                ? ContainerRegistrar.applyTemplateReplacing(world, randomizable, rebuilt, true)
+                                : ContainerRegistrar.applyTemplate(world, randomizable, rebuilt, true);
+                    }
                 } else {
                     registered = ContainerCompatibility.registerWithLootTable(world, be, tableId,
                             block.lootTableSeed(), true);
@@ -424,19 +438,30 @@ public final class ChestShareCommands {
             // reporting a "restore" every single time.
             if (wasShared) {
                 SharedContainerEntry existing = SharedContainersState.get(world).getBlock(targetPos);
-                if (existing != null && sharedEntryMatchesBaked(existing, block.items())) {
-                    skippedShared++;
-                    continue;
+                if (existing != null) {
+                    ContainerCompatibility.CompatInventory inv = ContainerCompatibility.getContainerInventory(be);
+                    int containerSize = inv == null ? 0 : inv.size();
+                    if (sharedEntryMatchesBaked(existing, block.items(), containerSize)) {
+                        skippedShared++;
+                        continue;
+                    }
                 }
             }
             SharedContainerEntry registered;
             if (be instanceof RandomizableContainerBlockEntity randomizable) {
                 // Vanilla-class container with baked items: go through ContainerRegistrar so the
                 // block entity's own loot table gets cleared too, not just its inventory.
-                registered = ContainerRegistrar.applyTemplate(world, randomizable,
-                        new ContainerTemplate.ItemListTemplate(
-                                ContainerCompatibility.toStacks(block.items(), randomizable.getContainerSize()),
-                                randomizable.getContainerSize()), true);
+                // wasShared here means sharedEntryMatchesBaked (above) already ruled out a false
+                // negative - this is a genuine mismatch, so the plain applyTemplate's "never
+                // overwrite an existing entry" guard must be bypassed via applyTemplateReplacing,
+                // or the restore silently no-ops (see ContainerRegistrar's javadoc, and
+                // command/NOTES.md).
+                ContainerTemplate.ItemListTemplate rebuilt = new ContainerTemplate.ItemListTemplate(
+                        ContainerCompatibility.toStacks(block.items(), randomizable.getContainerSize()),
+                        randomizable.getContainerSize());
+                registered = wasShared
+                        ? ContainerRegistrar.applyTemplateReplacing(world, randomizable, rebuilt, true)
+                        : ContainerRegistrar.applyTemplate(world, randomizable, rebuilt, true);
             } else {
                 registered = ContainerCompatibility.registerWithItems(world, be, block.items(), true);
             }
@@ -552,18 +577,32 @@ public final class ChestShareCommands {
      *  sets (slot+id+count), the same granularity {@link FingerprintRegistry} itself matches at,
      *  rather than full ItemStack equality (which would also compare NBT/components the registry
      *  never recorded in the first place). Used so a second adopt-structure run over an already-
-     *  correct container reports "already shared", not another "restored". */
+     *  correct container reports "already shared", not another "restored".
+     *
+     *  Both sides are put through {@link ContainerCompatibility#toStacks} - the same size-bounded,
+     *  slot-indexed pass that built the stored entry in the first place - before comparing. This
+     *  used to compare the (already-normalized) stored entry against the raw `baked` list
+     *  directly: any baked item toStacks silently drops (a slot at or past this container's
+     *  current size, an item id no longer resolvable in the registry) or collapses (two baked
+     *  entries claiming the same slot) survives in `baked` but never made it into the stored
+     *  entry, so the two sides could never agree - one specific container's baked list hitting any
+     *  of those would fail this check forever and get "restored" again on every single run,
+     *  regardless of how many times the command was re-run. */
     private static boolean sharedEntryMatchesBaked(SharedContainerEntry existing,
-            List<FingerprintRegistry.FingerprintItem> baked) {
+            List<FingerprintRegistry.FingerprintItem> baked, int size) {
         if (!(existing.template() instanceof ContainerTemplate.ItemListTemplate t)) return false;
-        java.util.Set<FingerprintRegistry.FingerprintItem> current = new java.util.HashSet<>();
-        List<ItemStack> items = t.items();
-        for (int i = 0; i < items.size(); i++) {
-            ItemStack stack = items.get(i);
+        List<ItemStack> normalizedBaked = ContainerCompatibility.toStacks(baked, size);
+        return fingerprintSetOf(t.items()).equals(fingerprintSetOf(normalizedBaked));
+    }
+
+    private static java.util.Set<FingerprintRegistry.FingerprintItem> fingerprintSetOf(List<ItemStack> stacks) {
+        java.util.Set<FingerprintRegistry.FingerprintItem> result = new java.util.HashSet<>();
+        for (int i = 0; i < stacks.size(); i++) {
+            ItemStack stack = stacks.get(i);
             if (stack == null || stack.isEmpty()) continue;
-            current.add(new FingerprintRegistry.FingerprintItem(i, FingerprintRegistry.idOf(stack), stack.getCount()));
+            result.add(new FingerprintRegistry.FingerprintItem(i, FingerprintRegistry.idOf(stack), stack.getCount()));
         }
-        return current.equals(new java.util.HashSet<>(baked));
+        return result;
     }
 
     /** The live-world counterpart of compat/ContainerFingerprintFilter: is this block entity

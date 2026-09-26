@@ -9,6 +9,7 @@ import dev.chestshare.state.SharedContainersState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.CompoundContainer;
 import net.minecraft.world.Container;
 import net.minecraft.world.MenuProvider;
 import net.minecraft.world.entity.player.Inventory;
@@ -86,17 +87,43 @@ public final class SharedContainerOpener {
         BlockPos pos = be.getBlockPos();
         SharedContainerEntry entry = state.getBlock(pos);
         boolean marked = be instanceof SharedMarker m && m.chestshare$isShared();
-        if (entry != null && !marked) { state.removeBlock(pos); return null; }
+        // SharedContainersState is authoritative, not the marker flag - see NOTES.md
+        if (entry != null && !marked && be instanceof SharedMarker m) { m.chestshare$setShared(true); be.setChanged(); }
         return entry;
     }
 
+    /** Resolves an ALREADY-registered shared entry for a generic (Container-based) modded
+     *  block - Carved Wood, Handcrafted, and similar. Deliberately never registers a new
+     *  one: called from both open-time paths (UseBlockCallback and replaceFactory), which
+     *  fire on every single interaction with no freshlyGenerated gate. Registering here
+     *  unconditionally would repeat, for these Container-based compat blocks, the exact
+     *  bug already fixed for the reflective (Sophisticated Storage) path: a player's own
+     *  freshly-placed Carved Wood barrel would be silently converted into a shared
+     *  container the first time they opened it. Registration for these containers must
+     *  only ever happen via the freshlyGenerated-gated passive scan in ContainerScanner,
+     *  through scanRegisterGenericContainer below. See NOTES.md. */
     private static SharedContainerEntry resolveGenericEntry(ServerLevel world, BlockEntity be, Container container) {
         SharedContainersState state=SharedContainersState.get(world); BlockPos pos=be.getBlockPos();
         SharedContainerEntry entry=state.getBlock(pos); boolean marked=be instanceof SharedMarker m && m.chestshare$isShared();
-        if(entry!=null&&!marked){state.removeBlock(pos);return null;}
+        // SharedContainersState is authoritative, not the marker flag - see NOTES.md
+        // (the "delete on desync" version of this deleted real, freshly-written data).
+        if(entry!=null&&!marked&&be instanceof SharedMarker m){m.chestshare$setShared(true);be.setChanged();}
+        return entry;
+    }
+
+    /** Registers a generic (Container-based) modded block as shared, stealing its current
+     *  contents - only safe to call from ContainerScanner's freshlyGenerated-gated passive
+     *  scan path. See the resolveGenericEntry javadoc above for why every other call site
+     *  must use the non-registering resolve instead. */
+    public static SharedContainerEntry scanRegisterGenericContainer(ServerLevel world, BlockEntity be, Container container) {
+        SharedContainersState state=SharedContainersState.get(world); BlockPos pos=be.getBlockPos();
+        SharedContainerEntry entry=state.getBlock(pos); boolean marked=be instanceof SharedMarker m && m.chestshare$isShared();
+        // SharedContainersState is authoritative, not the marker flag - see NOTES.md
+        if(entry!=null&&!marked&&be instanceof SharedMarker m){m.chestshare$setShared(true);be.setChanged();}
         if(entry==null){
             entry=new SharedContainerEntry(new ContainerTemplate.ItemListTemplate(ContainerRegistrar.copyContents(container),container.getContainerSize()));
             state.putBlock(pos,entry);
+            state.setDirty();
             for(int i=0;i<container.getContainerSize();i++)container.setItem(i,ItemStack.EMPTY);
             if(be instanceof SharedMarker m)m.chestshare$setShared(true);
             be.setChanged();
@@ -108,7 +135,14 @@ public final class SharedContainerOpener {
     public static SharedContainerEntry resolveBlockEntry(ServerLevel world, RandomizableContainerBlockEntity container) {
         SharedContainersState state=SharedContainersState.get(world); BlockPos pos=container.getBlockPos();
         SharedContainerEntry entry=state.getBlock(pos); boolean marked=((SharedMarker)container).chestshare$isShared();
-        if(entry!=null&&!marked){state.removeBlock(pos);return null;}
+        // SharedContainersState is authoritative, not the marker flag - see NOTES.md. The old
+        // "delete on desync" version of this line was the actual cause of a real bug: a
+        // container correctly registered by /chestshare adopt-structure's loot-table branch
+        // would have its brand-new entry deleted the next time a player opened it, if the
+        // marker flag on the freshly-read block entity instance didn't agree - producing the
+        // exact symptom of "restored" being reported on every single run, forever, even
+        // within one continuous server session with no restart involved.
+        if(entry!=null&&!marked){((SharedMarker)container).chestshare$setShared(true);container.setChanged();}
         if(entry==null&&marked)return ContainerRegistrar.registerForced(world,container);
         if(entry==null&&container.getLootTable()!=null)return ContainerRegistrar.register(world,container);
         return entry;
@@ -127,9 +161,26 @@ public final class SharedContainerOpener {
             ServerPlayer player=(ServerPlayer)p;
             List<ItemStack> first=getOrCreateInstance(world,player,primary,Vec3.atCenterOf(primaryPos),fallbackSeedFor(world,primaryPos),27);
             List<ItemStack> second=getOrCreateInstance(world,player,secondary,Vec3.atCenterOf(secondaryPos),fallbackSeedFor(world,secondaryPos),27);
-            SharedInventory si=new SharedInventory(54,x->{primary.putInstance(player.getUUID(),copyRange(x,0,27));secondary.putInstance(player.getUUID(),copyRange(x,27,54));SharedContainersState.get(world).setDirty();},viewer->stateValidBlock(world,primaryPos,primary,viewer)&&stateValidBlock(world,secondaryPos,secondary,viewer));
+            SharedInventory si=new SharedInventory(54,x->{primary.putInstance(player.getUUID(),copyRange(x,0,27));secondary.putInstance(player.getUUID(),copyRange(x,27,54));primary.clearEmptyInstances();secondary.clearEmptyInstances();SharedContainersState.get(world).setDirty();},viewer->stateValidBlock(world,primaryPos,primary,viewer)&&stateValidBlock(world,secondaryPos,secondary,viewer));
             for(int i=0;i<27;i++){si.setItem(i,first.get(i).copy());si.setItem(27+i,second.get(i).copy());} si.finishSeeding();
             return new ChestMenu(MenuType.GENERIC_9x6,sync,inv,si,6);
+        });
+    }
+    /** Double chest where exactly ONE half is shared and the other is an ordinary chest, e.g. a
+     *  player's own chest placed next to a loot/structure chest. The shared half is shown from the
+     *  viewing player's own instance; the ordinary half is its real, live inventory - never
+     *  registered, never captured, so the player's own storage stays exactly what it was and is
+     *  seen identically by everyone. Slot order matches doubleChestFactory: whichever half is
+     *  "first" occupies slots 0-26. Validity of the ordinary half (still placed, still in range)
+     *  is checked by CompoundContainer#stillValid, which requires both halves to be valid. */
+    public static MenuProvider mixedDoubleChestFactory(ServerLevel world, BlockPos sharedPos, SharedContainerEntry shared, Container plainHalf, boolean sharedIsFirst) {
+        return provider(net.minecraft.network.chat.Component.translatable("container.chestDouble"), (sync,inv,p)->{
+            ServerPlayer player=(ServerPlayer)p;
+            List<ItemStack> items=getOrCreateInstance(world,player,shared,Vec3.atCenterOf(sharedPos),fallbackSeedFor(world,sharedPos),27);
+            SharedInventory si=new SharedInventory(27,x->save(shared,player,x,world),viewer->stateValidBlock(world,sharedPos,shared,viewer));
+            fill(si,items); si.finishSeeding();
+            Container combined=sharedIsFirst?new CompoundContainer(si,plainHalf):new CompoundContainer(plainHalf,si);
+            return new ChestMenu(MenuType.GENERIC_9x6,sync,inv,combined,6);
         });
     }
     private static List<ItemStack> copyRange(SharedInventory inv,int from,int to){List<ItemStack> out=new ArrayList<>(to-from);for(int i=from;i<to;i++)out.add(inv.getItem(i).copy());return out;}
@@ -154,7 +205,7 @@ public final class SharedContainerOpener {
     }
     private static MenuProvider provider(net.minecraft.network.chat.Component title, net.minecraft.world.inventory.MenuConstructor constructor){ return new MenuProvider(){public net.minecraft.network.chat.Component getDisplayName(){return title;} public AbstractContainerMenu createMenu(int id,Inventory inv,Player p){return constructor.createMenu(id,inv,p);}}; }
     private static void fill(SharedInventory inv,List<ItemStack> items){for(int i=0;i<inv.getContainerSize();i++)inv.setItem(i,i<items.size()?items.get(i).copy():ItemStack.EMPTY);}
-    private static void save(SharedContainerEntry entry,Player p,SharedInventory inv,ServerLevel world){entry.putInstance(p.getUUID(),ContainerRegistrar.copyContents(inv));SharedContainersState.get(world).setDirty();}
+    private static void save(SharedContainerEntry entry,Player p,SharedInventory inv,ServerLevel world){entry.putInstance(p.getUUID(),ContainerRegistrar.copyContents(inv));entry.clearEmptyInstances();SharedContainersState.get(world).setDirty();}
     private static boolean stateValidBlock(ServerLevel world,BlockPos pos,SharedContainerEntry e,Player p){return SharedContainersState.get(world).getBlock(pos)==e&&p.distanceToSqr(Vec3.atCenterOf(pos))<=MAX_USE_DISTANCE_SQ;}
     private static boolean stateValidEntity(ServerLevel world,MinecartChest cart,SharedContainerEntry e,Player p){return SharedContainersState.get(world).getEntity(cart.getUUID())==e&&!cart.isRemoved()&&p.distanceToSqr(cart.position())<=MAX_USE_DISTANCE_SQ;}
     public static List<ItemStack> getOrCreateInstance(ServerLevel world,ServerPlayer player,SharedContainerEntry entry,Vec3 origin,long fallbackSeed,int size){List<ItemStack> stored=entry.getInstance(player.getUUID()); if(stored!=null){List<ItemStack> out=new ArrayList<>();for(int i=0;i<size;i++)out.add(i<stored.size()?stored.get(i).copy():ItemStack.EMPTY);return out;} List<ItemStack> created=entry.template().createStacks(world,origin,player,fallbackSeed,size,world.registryAccess());entry.putInstance(player.getUUID(),created);SharedContainersState.get(world).setDirty();return created;}

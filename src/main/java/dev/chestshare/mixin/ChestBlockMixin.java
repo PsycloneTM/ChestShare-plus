@@ -1,6 +1,5 @@
 package dev.chestshare.mixin;
 
-import dev.chestshare.ContainerRegistrar;
 import dev.chestshare.open.SharedContainerOpener;
 import dev.chestshare.state.SharedContainerEntry;
 import net.minecraft.core.BlockPos;
@@ -41,10 +40,28 @@ public abstract class ChestBlockMixin {
         SharedContainerEntry first = SharedContainerOpener.resolveBlockEntry(world, primary);
         SharedContainerEntry second = SharedContainerOpener.resolveBlockEntry(world, secondary);
         if (first == null && second == null) return;
-        if (first == null) first = ContainerRegistrar.registerForced(world, primary);
-        if (second == null) second = ContainerRegistrar.registerForced(world, secondary);
 
         boolean primaryIsLeft = state.getValue(ChestBlock.TYPE) == ChestType.LEFT;
+
+        // Exactly one half is shared; the other is an ordinary chest (a null here means
+        // resolveBlockEntry found nothing to share: no loot table, not registered, not marked).
+        // That half is left completely alone - it is NOT force-registered. Force-registering it
+        // would capture a player's own chest contents into a template that every other player
+        // then receives a copy of, and would blank the chest itself. Instead the menu shows the
+        // shared half from the player's own instance next to the ordinary half's live inventory.
+        // (Handing doubleChestFactory a null entry NPEs the instant the menu is opened.)
+        if (first == null || second == null) {
+            boolean primaryShared = first != null;
+            SharedContainerEntry sharedEntry = primaryShared ? first : second;
+            BlockPos sharedPos = primaryShared ? pos : other;
+            ChestBlockEntity plain = primaryShared ? secondary : primary;
+            // "first" (slots 0-26) is the LEFT half, matching doubleChestFactory's ordering below.
+            boolean sharedIsFirst = primaryShared == primaryIsLeft;
+            cir.setReturnValue(SharedContainerOpener.mixedDoubleChestFactory(
+                    world, sharedPos, sharedEntry, plain, sharedIsFirst));
+            return;
+        }
+
         BlockPos firstPos = primaryIsLeft ? pos : other;
         BlockPos secondPos = primaryIsLeft ? other : pos;
         SharedContainerEntry firstEntry = primaryIsLeft ? first : second;

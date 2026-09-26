@@ -3,6 +3,72 @@ For the public-facing summary of what changed vs. upstream ChestShare 0.2.3,
 see README.md instead. Version numbers below reflect internal iteration and
 do not match the version this fork is actually published under.
 
+ChestShare 0.3.9
+
+A read-through of the whole source tree, which turned up three problems. All
+three were found by tracing code paths by hand, not by a failing build; the
+"why" for each also lives in the NOTES.md next to the code it concerns.
+
+1. FRESHLY_GENERATED_CHUNKS was a Set<Long> of ChunkPos.toLong() values shared
+   by every dimension. toLong() encodes only x/z, and every dimension uses the
+   same coordinates, so a chunk generated in one dimension could be consumed
+   (Set#remove returning true) by an unrelated, already-existing chunk loading
+   at the same x/z in another - which was then scanned as freshlyGenerated, the
+   precise case the set exists to rule out. Now a Set<ChunkKey> where ChunkKey
+   is (ResourceKey<Level> dimension, long chunkPos).
+
+2. ChestBlockMixin threw a NullPointerException opening a double chest with one
+   shared half and one ordinary half. The old code force-registered a half that
+   resolveBlockEntry returned null for, purely so doubleChestFactory (which
+   calls entry.getInstance on BOTH halves) would get a non-null entry - but
+   registerForced returns null for an empty chest with no loot table, so a
+   player's fresh chest beside a loot chest gave a null entry and the NPE.
+   Worse, the same call on a NON-empty ordinary half captured the player's own
+   items as a template, emptied the chest, and gave every other player a copy.
+   Went through two versions:
+     - First a null guard that returned to vanilla's menu. Rejected: registering
+       the shared half empties its live block entity, so that half showed up
+       empty; and once the player put items into the ordinary half, the next
+       open force-registered it via the path above.
+     - Final: the ordinary half is never registered. New
+       SharedContainerOpener.mixedDoubleChestFactory builds a CompoundContainer
+       of (the shared half's per-player SharedInventory) and (the real chest).
+       Slot order matches doubleChestFactory: the LEFT half is slots 0-26.
+   Nothing in the notes explained the neighbor force-registration, so it was
+   treated as a workaround for the null problem rather than intended design. If
+   that reading is wrong, it is the two registerForced lines in the mixin.
+
+3. Reflection lookups in ContainerCompatibility.findHandler were only partly
+   cached (WRAPPER_METHODS covered getStorageWrapper(); the handler, slot-count
+   and get/set resolution was re-walked on every scan and right-click). Added
+   HANDLER_RECIPES, a per-class cache of successfully resolved Methods/Fields;
+   see compat/NOTES.md. Testing against stand-in classes caught a hole in the
+   first version: get/set are invoked lazily and Handler swallows exceptions, so
+   a handler of an unexpected class would have read as empty and dropped writes
+   silently. Sophisticated.build now rejects it (isInstance check) and falls
+   back to the full search. Measured on stand-in classes: about 330 ns down to
+   about 38 ns per isSupportedContainer call for a supported container;
+   ordinary block entities were already cheap (~15 ns) and are unchanged.
+
+Verification, honestly: ContainerCompatibility was compiled with javac 21
+against stubs and run against fake Sophisticated-style classes (ten checks -
+per-instance slot counts, transient null wrapper, zero slots, cache not
+poisoned by a failure, mismatched handler class; identical results to the
+pre-cache code). The other changed files were only syntax-checked, and the
+slot-order logic in the mixin was checked with a truth table. None of it has
+been built against Minecraft/Fabric or tried in-game - run ./gradlew build and
+try a double chest (shared + ordinary, both orientations, two players).
+
+Known and deliberately left alone:
+ - ChestShare's scan loop only removes a chunk's FRESHLY_GENERATED_CHUNKS entry
+   when the chunk is actually scanned. If the "is this still the loaded chunk"
+   re-check fails, the flag survives and the chunk would be treated as new the
+   next time it loads from disk. Rare and low impact, but it fails open;
+   hoisting the remove above the if would fail safe. (See NOTES.md.)
+ - The "generic modded Container" branch at the end of resolveHandler is
+   unreachable: getContainerInventory returns early for anything that is a
+   Container, and findHandler has no other caller. Harmless dead code.
+
 ChestShare 0.3.8
 
 Two changes, prompted by comparing against a different mod's (proven, shipped)
@@ -192,3 +258,51 @@ Fix:
 - Explicit compatibility is still attempted before generic
   RandomizableContainerBlockEntity handling.
 - No CHUNK_GENERATE scanning.
+
+---
+
+Found and fixed a second instance of the auto-register-on-open bug
+(previously fixed only for the reflective/Sophisticated-Storage path via
+resolveCompatEntry), this time in SharedContainerOpener.resolveGenericEntry
+- the path used for Container-based compat blocks like Carved Wood and
+Handcrafted. Same root cause, same fix shape: resolveGenericEntry is now
+resolve-only (never registers), and a new scanRegisterGenericContainer
+method carries the actual registration logic, callable only from
+ContainerScanner's freshlyGenerated-gated passive scan. Both open-time call
+sites (ChestShare's UseBlockCallback, and replaceFactory itself) now go
+through the non-registering resolve. Also added the state.setDirty() call
+this registration path was missing (every other registration path in the
+codebase already had it), so a newly-shared generic container is now
+guaranteed to persist across a server stop, not just an autosave.
+
+Also adopted, from a parallel line of work on this same codebase: a fix for
+NbtIo.readCompressed's allocation cap (was 64 MiB, now unlimitedHeap()) in
+both FingerprintRegistry's structure scan and ChestShareCommands' import
+path. Several real Cobbleverse structures - the four regional leagues,
+team_galactic_hq, stark_mountain, secret_garden, sky_pillar, newmoon_island,
+and fullmoon_island - are legitimate megastructures that were silently
+failing to parse under the old cap, some by only tens of bytes. This is the
+most likely explanation for a report of a structure's containers (Fullmoon
+Island specifically) never being recorded in the fingerprint database at
+all, despite genuinely containing baked-item storage blocks.
+
+Also adopted: structure-provenance tracking on SharedContainerEntry (a
+nullable structureTemplate ResourceLocation, persisted in NBT) and
+StructureContainerRestorer.tryRepairSharedStructure, which reconciles a
+container that is shared in SharedContainersState but whose SharedMarker
+flag or structure claim has drifted (e.g. after a block-entity reload),
+without ever discarding real per-player loot state to do so.
+
+Passive scan no longer repairs anything: ContainerScanner now skips any block
+entity already present in SharedContainersState (`if (stateShared) continue;`).
+StructureContainerRestorer.tryRepairSharedStructure - described in the entry
+above - has been deleted, along with SharedContainerEntry.setStructureTemplate
+(provenance is now final, set at construction) and the
+"structureTemplate != null bypasses the already-shared guards" escape hatch in
+ContainerRegistrar.applyTemplate, which existed only so the repair pass could
+overwrite an entry. tryRestoreEmpty (behind restore-empty-structures, default
+off) is unchanged: it only ever acts on a position with no registration and an
+unflagged block entity. Trade-off: the marker/state drift the repair pass
+healed (a shared entry whose block entity has chestshare:shared false) is now
+only ever resolved at open time, where resolveBlockEntry / resolveCompatEntry /
+resolveGenericEntry drop the entry as stale.

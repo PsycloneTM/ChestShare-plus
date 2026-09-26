@@ -5,6 +5,7 @@ import dev.chestshare.compat.FingerprintRegistry;
 import dev.chestshare.compat.StructurePlacement;
 import dev.chestshare.state.ContainerTemplate;
 import dev.chestshare.state.SharedContainerEntry;
+import dev.chestshare.state.SharedContainersState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
@@ -25,47 +26,44 @@ import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemp
 import java.util.ArrayList;
 import java.util.List;
 
-/** The passive counterpart of {@code /chestshare adopt-structure}, for the one case where doing it
- *  without an admin is defensible: an EMPTY container standing at exactly the position, and being
- *  exactly the block, that a registered structure template places a storage block. It is refilled
- *  from the template (baked items or loot table) and registered as a shared container.
- *
- *  Called from {@link ContainerScanner} for chunks that already existed (a freshly generated chunk
- *  registers everything through its own branches). Off unless
- *  {@link ChestShareConfig#restoreEmptyStructureContainers()} is true. See NOTES.md.
- *
- *  Every check below has to pass; failing any of them just leaves the container alone:
- *  <ul>
- *    <li>the container is unshared, holds nothing, and has no loot table left (a container that
- *        still has one is handled by the ordinary loot-table branch);</li>
- *    <li>it is a chest, barrel, shulker box or supported modded container - never a hopper,
- *        dispenser or furnace;</li>
- *    <li>a structure piece covers it, that piece is a jigsaw piece whose template id the game
- *        reports outright, and the template has recorded storage blocks. The layout-matching and
- *        content-alignment guesses adopt-structure falls back on are NOT used here;</li>
- *    <li>the template block, moved through that piece's rotation and origin, lands on this exact
- *        position, and exactly one piece/block claims it;</li>
- *    <li>the template block is the same block that is standing here now, carries either baked
- *        items or a loot table, and comes from a single-palette template.</li>
- *  </ul>
- *  Only this container's own block entity, the chunk's structure references and the structure
- *  start are read - never a block entity in another chunk, so the scan can't force chunk loads
- *  by looking at the rest of a piece that spills across a chunk border. */
 public final class StructureContainerRestorer {
     private StructureContainerRestorer() {}
 
     private record Claim(ResourceLocation templateId, FingerprintRegistry.StructureStorageBlock block) {}
 
-    /** @return true if the container was refilled and registered as shared. */
     public static boolean tryRestoreEmpty(ServerLevel world, BlockEntity be) {
         if (!ChestShareConfig.restoreEmptyStructureContainers()) return false;
         if (!FingerprintRegistry.isBuilt()) return false;
-        if (!(be instanceof SharedMarker marker) || marker.chestshare$isShared()) return false;
-        if (!isRestorableType(be) || !isEmptyWithoutLootTable(be)) return false;
+        if (!(be instanceof SharedMarker marker)) return false;
+        if (marker.chestshare$isShared()) return false;
+        if (!isRestorableType(be)) return false;
 
+        SharedContainersState state = SharedContainersState.get(world);
+        if (state.getBlock(be.getBlockPos()) != null) return false;
+
+        Claim claim = findSingleClaim(world, be);
+        if (claim == null) return false;
+        FingerprintRegistry.StructureStorageBlock block = claim.block();
+        if (block.multiPalette() || block.blockId() == null || block.emptyInTemplate()) return false;
+
+        String liveBlockId = BuiltInRegistries.BLOCK.getKey(be.getBlockState().getBlock()).toString();
+        if (!block.blockId().equals(liveBlockId) || !isEmptyWithoutLootTable(be)) return false;
+
+        ContainerTemplate expectedTemplate = expectedTemplate(be, block);
+        if (expectedTemplate == null) return false;
+        SharedContainerEntry entry = applyStructureTemplate(world, be, claim, expectedTemplate);
+        if (entry == null) return false;
+
+        ChestShare.LOGGER.info("[ChestShare] restored empty structure container '{}' at {} in {} from {} ({})",
+                be.getClass().getSimpleName(), be.getBlockPos(), world.dimension().location(),
+                claim.templateId(), restoredDescription(block));
+        return true;
+    }
+
+    private static Claim findSingleClaim(ServerLevel world, BlockEntity be) {
         BlockPos pos = be.getBlockPos();
         StructureStart start = world.structureManager().getStructureWithPieceAt(pos, h -> true);
-        if (start == null || !start.isValid()) return false;
+        if (start == null || !start.isValid()) return null;
 
         List<Claim> claims = new ArrayList<>();
         for (StructurePiece piece : start.getPieces()) {
@@ -73,76 +71,65 @@ public final class StructureContainerRestorer {
             if (!piece.getBoundingBox().isInside(pos)) continue;
             ResourceLocation templateId = StructurePlacement.resolveTemplateId(poolPiece);
             if (templateId == null) continue;
-            List<FingerprintRegistry.StructureStorageBlock> blocks =
-                    FingerprintRegistry.getStructureStorageBlocks(templateId);
+            List<FingerprintRegistry.StructureStorageBlock> blocks = FingerprintRegistry.getStructureStorageBlocks(templateId);
             if (blocks == null) continue;
             Rotation rotation = poolPiece.getRotation();
             BlockPos origin = poolPiece.getPosition();
             for (FingerprintRegistry.StructureStorageBlock block : blocks) {
-                // Same placement transform adopt-structure uses, so both agree on where a
-                // template block lands in the world.
-                BlockPos worldPos = StructureTemplate.transform(
-                        new BlockPos(block.x(), block.y(), block.z()), Mirror.NONE, rotation, BlockPos.ZERO)
-                        .offset(origin);
+                BlockPos worldPos = StructureTemplate.transform(new BlockPos(block.x(), block.y(), block.z()),
+                        Mirror.NONE, rotation, BlockPos.ZERO).offset(origin);
                 if (worldPos.equals(pos)) claims.add(new Claim(templateId, block));
             }
         }
-        // Two pieces (or two blocks) both claiming this position means the placement isn't
-        // understood well enough to act on. adopt-structure can be told to look; the scan can't.
-        if (claims.size() != 1) return false;
-
-        Claim claim = claims.get(0);
-        FingerprintRegistry.StructureStorageBlock block = claim.block();
-        if (block.multiPalette() || block.blockId() == null || block.emptyInTemplate()) return false;
-        String liveBlockId = BuiltInRegistries.BLOCK.getKey(be.getBlockState().getBlock()).toString();
-        if (!block.blockId().equals(liveBlockId)) return false;
-
-        SharedContainerEntry entry;
-        String restoredFrom;
-        if (block.hasLootTable()) {
-            ResourceLocation tableId = ResourceLocation.tryParse(block.lootTable());
-            if (tableId == null) return false;
-            if (be instanceof RandomizableContainerBlockEntity randomizable) {
-                entry = ContainerRegistrar.applyTemplate(world, randomizable,
-                        new ContainerTemplate.LootTableTemplate(tableId, block.lootTableSeed(),
-                                randomizable.getContainerSize()), false);
-            } else {
-                entry = ContainerCompatibility.registerWithLootTable(world, be, tableId,
-                        block.lootTableSeed(), false);
-            }
-            restoredFrom = "loot table " + tableId;
-        } else {
-            if (be instanceof RandomizableContainerBlockEntity randomizable) {
-                int size = randomizable.getContainerSize();
-                entry = ContainerRegistrar.applyTemplate(world, randomizable,
-                        new ContainerTemplate.ItemListTemplate(
-                                ContainerCompatibility.toStacks(block.items(), size), size), false);
-            } else {
-                entry = ContainerCompatibility.registerWithItems(world, be, block.items(), false);
-            }
-            restoredFrom = block.items().size() + " baked item(s)";
-        }
-        if (entry == null) return false;
-
-        ChestShare.LOGGER.info("[ChestShare] restored empty structure container '{}' at {} in {} from {} ({})",
-                be.getClass().getSimpleName(), pos, world.dimension().location(), claim.templateId(), restoredFrom);
-        return true;
+        return claims.size() == 1 ? claims.get(0) : null;
     }
 
-    /** The passive path's own, deliberately narrow, idea of what it may take over. Mirrors
-     *  adopt-structure's notion of an adoptable container minus its "carries a loot table" clause
-     *  (which can't apply to a container we already know has none). */
+    private static SharedContainerEntry applyStructureTemplate(ServerLevel world, BlockEntity be,
+            Claim claim, ContainerTemplate expectedTemplate) {
+        FingerprintRegistry.StructureStorageBlock block = claim.block();
+        if (block.hasLootTable()) {
+            ResourceLocation tableId = ResourceLocation.tryParse(block.lootTable());
+            if (tableId == null) return null;
+            if (be instanceof RandomizableContainerBlockEntity randomizable) {
+                return ContainerRegistrar.applyTemplate(world, randomizable, expectedTemplate, false, claim.templateId());
+            }
+            return ContainerCompatibility.registerWithLootTable(world, be, tableId, block.lootTableSeed(), false, claim.templateId());
+        }
+        if (be instanceof RandomizableContainerBlockEntity randomizable) {
+            return ContainerRegistrar.applyTemplate(world, randomizable, expectedTemplate, false, claim.templateId());
+        }
+        return ContainerCompatibility.registerWithItems(world, be, block.items(), false, claim.templateId());
+    }
+
+    private static String restoredDescription(FingerprintRegistry.StructureStorageBlock block) {
+        if (block.hasLootTable()) return "loot table " + ResourceLocation.tryParse(block.lootTable());
+        return block.items().size() + " baked item(s)";
+    }
+
+    private static ContainerTemplate expectedTemplate(BlockEntity be, FingerprintRegistry.StructureStorageBlock block) {
+        if (block.hasLootTable()) {
+            ResourceLocation tableId = ResourceLocation.tryParse(block.lootTable());
+            if (tableId == null) return null;
+            int size = be instanceof RandomizableContainerBlockEntity randomizable ? randomizable.getContainerSize() : sizeOf(be);
+            return size > 0 ? new ContainerTemplate.LootTableTemplate(tableId, block.lootTableSeed(), size) : null;
+        }
+        int size = be instanceof RandomizableContainerBlockEntity randomizable ? randomizable.getContainerSize() : sizeOf(be);
+        if (size <= 0) return null;
+        return new ContainerTemplate.ItemListTemplate(ContainerCompatibility.toStacks(block.items(), size), size);
+    }
+
+    private static int sizeOf(BlockEntity be) {
+        ContainerCompatibility.CompatInventory inv = ContainerCompatibility.getContainerInventory(be);
+        return inv == null ? 0 : inv.size();
+    }
+
     private static boolean isRestorableType(BlockEntity be) {
         if (ContainerCompatibility.isSupportedContainer(be)) return true;
-        return be instanceof ChestBlockEntity || be instanceof BarrelBlockEntity
-                || be instanceof ShulkerBoxBlockEntity;
+        return be instanceof ChestBlockEntity || be instanceof BarrelBlockEntity || be instanceof ShulkerBoxBlockEntity;
     }
 
     private static boolean isEmptyWithoutLootTable(BlockEntity be) {
         if (be instanceof RandomizableContainerBlockEntity randomizable) {
-            // getLootTable() first, and it must short-circuit: RandomizableContainerBlockEntity
-            // #isEmpty() unpacks a pending loot table, which would roll and destroy the very
-            // template this container is registered from.
             return randomizable.getLootTable() == null && randomizable.isEmpty();
         }
         ContainerCompatibility.CompatInventory inv = ContainerCompatibility.getContainerInventory(be);

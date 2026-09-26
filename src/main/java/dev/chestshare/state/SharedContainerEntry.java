@@ -10,18 +10,39 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import net.minecraft.resources.ResourceLocation;
 
 public final class SharedContainerEntry {
     private final ContainerTemplate template;
+    /** Template id when this registration was created by the automatic structure-restorer.
+     *  Null means the registration came from the normal/manual sharing paths, or is a legacy
+     *  entry written before provenance was recorded. */
+    private final ResourceLocation structureTemplate;
     private final Map<UUID, List<ItemStack>> instances = new HashMap<>();
-    public SharedContainerEntry(ContainerTemplate template) { this.template = template; }
+    public SharedContainerEntry(ContainerTemplate template) { this(template, null); }
+    public SharedContainerEntry(ContainerTemplate template, ResourceLocation structureTemplate) {
+        this.template = template;
+        this.structureTemplate = structureTemplate;
+    }
+    public ResourceLocation structureTemplate() { return structureTemplate; }
     public ContainerTemplate template() { return template; }
     public List<ItemStack> getInstance(UUID id) { return instances.get(id); }
     public void putInstance(UUID id, List<ItemStack> stacks) { instances.put(id, copy(stacks)); }
     public void clearInstances() { instances.clear(); }
+    /** Drops every player's cached copy that holds no items at all, keeping the ones with loot
+     *  still in them (a player mid-loot keeps their progress). Returns how many were dropped;
+     *  those players roll afresh from the template on next open. An all-empty copy is either a
+     *  player who legitimately took everything or a roll that came out empty when it should not
+     *  have (the loot table did not resolve, an old bug) - the entry cannot tell which. */
+    public int clearEmptyInstances() {
+        int before = instances.size();
+        instances.values().removeIf(stacks -> stacks.stream().allMatch(s -> s == null || s.isEmpty()));
+        return before - instances.size();
+    }
     public CompoundTag toNbt(HolderLookup.Provider registries) {
         CompoundTag nbt = new CompoundTag();
         nbt.put("Template", template.toNbt(registries));
+        if (structureTemplate != null) nbt.putString("StructureTemplate", structureTemplate.toString());
         ListTag list = new ListTag();
         instances.forEach((id, stacks) -> {
             CompoundTag e = new CompoundTag();
@@ -44,7 +65,12 @@ public final class SharedContainerEntry {
     }
 
     public static SharedContainerEntry fromNbt(CompoundTag nbt, HolderLookup.Provider registries) {
-        SharedContainerEntry entry = new SharedContainerEntry(ContainerTemplate.fromNbt(nbt.getCompound("Template"), registries));
+        ResourceLocation structureTemplate = null;
+        if (nbt.contains("StructureTemplate")) {
+            structureTemplate = ResourceLocation.tryParse(nbt.getString("StructureTemplate"));
+        }
+        SharedContainerEntry entry = new SharedContainerEntry(
+                ContainerTemplate.fromNbt(nbt.getCompound("Template"), registries), structureTemplate);
         ListTag list = nbt.getList("Instances", 10);
         for (int i = 0; i < list.size(); i++) {
             CompoundTag e = list.getCompound(i);

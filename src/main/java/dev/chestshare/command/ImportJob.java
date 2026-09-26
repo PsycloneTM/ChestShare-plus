@@ -241,6 +241,7 @@ public final class ImportJob {
                             if (be instanceof SharedMarker marker) marker.chestshare$setShared(true);
                             be.setChanged();
                             state.putBlock(entry.pos(), new SharedContainerEntry(template));
+                            state.setDirty();
                             this.converted++;
                         }
                     }

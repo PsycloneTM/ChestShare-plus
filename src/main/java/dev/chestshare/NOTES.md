@@ -6,7 +6,7 @@ is where that context lives instead.
 
 ## ChestShare.java
 
-**`FRESHLY_GENERATED_CHUNKS`** — positions of chunks Fabric has told us are brand
+**`FRESHLY_GENERATED_CHUNKS`** — `(dimension, chunk position)` keys of chunks Fabric has told us are brand
 new (never existed before this moment), via `CHUNK_GENERATE`. Only membership in
 this set can make a chunk eligible for the compat/generic-modded auto-registration
 branches in `ContainerScanner`. A chunk that already existed (and so could already
@@ -14,6 +14,15 @@ contain a player's own storage) never enters this set no matter how many times i
 loaded afterward. This is what guarantees that adding the mod to an existing server
 never sweeps up a player's already-placed modded chests just because their chunk
 happens to load for the first time under the new mod version.
+
+**The key includes the dimension, on purpose.** `ChunkPos.toLong()` encodes only x/z,
+and every dimension uses the same coordinates (the spawn area exists in all of them,
+and a portal can land a chunk at matching coordinates in another). An earlier version
+keyed this set by that long alone, so a chunk generated in one dimension could be
+consumed (`Set#remove` returning `true`) by an unrelated, already-existing chunk
+loading at the same x/z in a different dimension. That old chunk was then scanned as
+`freshlyGenerated` - exactly the case this set exists to rule out - while the
+genuinely new chunk lost its flag. `ChunkKey(ResourceKey<Level>, long)` fixes it.
 
 **`CHUNK_GENERATE` registration** — only ever records the position here; no block
 entity or NBT access happens in this callback. The actual scan still happens
@@ -31,6 +40,14 @@ regardless of queue size.
 Before scanning a dequeued chunk, it re-checks that the exact same chunk object is
 still the currently-loaded one for that position — if it's been unloaded/reloaded
 since being queued, skip it rather than scanning stale/wrong state.
+
+**Known gap:** the `FRESHLY_GENERATED_CHUNKS` entry is only removed when a chunk is
+actually scanned, so if that re-check fails the flag is not consumed. A chunk that was
+generated and then unloaded before its queued scan ran keeps the flag, and would be
+treated as freshly generated the next time it loads from disk. It needs an unload
+inside the scan backlog and the chunk was barely loaded, so real impact is low - but
+it fails open rather than safe. Hoisting the `remove` above the `if` would fail safe.
+Not changed yet.
 
 **Reflective compat branch in `UseBlockCallback`** — compat containers (Sophisticated
 Storage, etc.) don't implement vanilla `Container`, so registering here and then
@@ -51,6 +68,19 @@ signal, so passive auto-registration for them is only safe to run on a chunk tha
 could not possibly contain a player build yet — hence every modded/generic branch
 in this file is gated on `freshlyGenerated`.
 
+- **Already-registered containers are skipped, full stop.** A block entity whose position is in
+  `SharedContainersState` is never touched by the passive scan: not rebuilt from a structure
+  template, not re-flagged, not re-stamped with provenance. There used to be a "repair" pass here
+  (`StructureContainerRestorer.tryRepairSharedStructure`) that reconciled a `SharedMarker` that had
+  drifted from the saved state, stamped legacy entries with a structure id, and - when a different
+  structure claimed the position - rebuilt the entry from the template, which resets loot state and
+  per-player data. It was removed on purpose; do not re-add a chunk-load path that rewrites an
+  existing entry. `ContainerRegistrar.applyTemplate` no longer has a way to overwrite one either.
+  **Consequence to know about:** the marker and the state are now reconciled only by the open-time
+  resolvers (`resolveBlockEntry` / `resolveCompatEntry` / `resolveGenericEntry`), which treat "state
+  entry exists but marker is false" as a stale entry and drop it. A marker that is lost from a block
+  entity's NBT for some reason (something other than ChestShare+ rewriting or re-creating the block
+  entity) is therefore no longer healed at chunk load.
 - **Compat branch** (Sophisticated Storage etc.): two sub-paths, gated differently:
   - **`freshlyGenerated` sub-path** (existing): if the chunk was just world-generated,
     any recognized compat container is registered directly. Same reasoning as before:
@@ -88,6 +118,41 @@ table, which would destroy the very template this method is trying to save.
 `applyTemplate()` clears the loot-table reference **first**, before calling
 `setItem()`. Otherwise `setItem()` may cause vanilla to unpack the original loot
 table while the container is mid-conversion.
+
+**Every `putBlock` write here must be followed by `state.setDirty()`.**
+`SharedContainersState` extends vanilla's `SavedData`, and vanilla's save
+system only writes a `SavedData` region back to disk if it's been marked
+dirty — `putBlock` alone only updates the in-memory map. This was a real,
+found bug: `applyTemplate` was missing this call, so a fresh registration
+looked completely successful for the rest of that server session (container
+opens fine, a re-run of the same command sees the entry and correctly treats
+it as already-registered) but was **never actually persisted** — the moment
+`SharedContainersState` reloaded from disk, most commonly a server restart,
+the registration was gone as if it had never happened. Two other write paths
+had the identical bug independently — `ChestShareCommands.convert`'s compat
+branch and `ImportJob.processChunk`'s compat branch, both of which write to
+`SharedContainersState` directly rather than through this class — see
+`command/NOTES.md` for those. Every `putBlock` call site in the codebase was
+checked after this fix; none are missing `setDirty()` now.
+
+**`applyTemplateReplacing(world, container, template, markDirty)` — the one
+deliberate exception to `applyTemplate`'s "never touch an already-registered
+position" guard, and it must stay that narrow.** `applyTemplate` refuses to
+write anything if the container is already marked shared or already has a
+`SharedContainersState` entry — that refusal is exactly what keeps the
+passive scanner, `/chestshare convert`, and the open path from ever
+clobbering real per-player loot state just because they happened to run
+again. But `/chestshare adopt-structure` has one genuinely different,
+deliberate job: when an admin explicitly asks it to reconcile a container
+whose stored entry has been confirmed (not just suspected — see
+`command/NOTES.md` on `sharedEntryMatchesBaked`) to disagree with the
+structure template, it has to actually overwrite that entry, which
+`applyTemplate` will never do. `applyTemplateReplacing` shares the same
+underlying write logic (both are thin wrappers over one private
+implementation) with `replaceExisting` forced `true`. It is only ever safe
+to call from that one explicit, operator-triggered command — see
+`command/NOTES.md` for the call sites and why every other caller must keep
+using the guarded `applyTemplate`.
 
 ## StructureContainerRestorer.java
 
@@ -154,3 +219,4 @@ or malformed file falls back to the default and logs why, the same as the old pr
 did. This preserves the original design's "an admin has to deliberately choose to enable this" safety
 posture while removing the friction of finding and editing a file, and (per the choice this was built
 around) letting a chosen value survive a restart instead of resetting to off every session.
+

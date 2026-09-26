@@ -72,6 +72,14 @@ deliberate defense-in-depth against a race between the tree's `requires()`
 evaluation and the handler actually running (e.g. two admins executing at
 overlapping ticks), not dead code to be cleaned up.
 
+**`convert`'s compat/modded branch writes to `SharedContainersState`
+directly, and must call `state.setDirty()` itself.** Unlike the vanilla
+branch (which goes through `ContainerRegistrar.register`, and so was
+already covered when that method's own missing `setDirty()` call was fixed
+— see the root `NOTES.md`), this branch calls `putBlock` on its own. It had
+the identical bug independently: a converted modded container looked
+successful for the rest of the session but was never actually saved.
+
 ## ImportJob.java
 
 Ported from 0.2.3's async/ticket-based importer, extended to cover modded/compat
@@ -134,6 +142,13 @@ happen instead of only contributing to a bare final count:
 Before this logging existed, a nonzero `missing` count in the final summary
 was undiagnosable — there was no way to tell "which positions" or "why"
 without editing the code.
+
+**`processChunk`'s compat branch writes to `SharedContainersState`
+directly, same bug as `convert`'s compat branch above, same fix.** The
+vanilla branch just above it goes through `ContainerRegistrar.applyTemplate`
+and was already covered once that method's missing `state.setDirty()` call
+was fixed (see the root `NOTES.md`); this branch calls `putBlock` on its
+own and needed its own identical fix.
 
 ## adoptStructure() / /chestshare adopt-structure
 
@@ -273,6 +288,41 @@ summary - reported every container as freshly "restored" a second time and, wors
 discarded and rebuilt every player's already-correct per-player roll for nothing. Both checks only
 compare identity of the template reference/contents, not the per-player instances themselves;
 `SharedContainerEntry.instances` is left untouched either way.
+
+**`sharedEntryMatchesBaked` must normalize both sides the same way, or idempotency silently
+breaks for one specific container forever.** The stored entry it compares against was built by
+`ContainerCompatibility.toStacks(baked, size)` — a size-bounded, slot-indexed pass that silently
+drops a baked item whose recorded slot is at or past the container's *current* size, silently
+drops one whose item id no longer resolves in the registry, and silently collapses two baked
+items that (incorrectly) share a slot into whichever one `toStacks` wrote last. An earlier version
+of this method compared that already-normalized stored entry against the raw `baked` list
+directly, instead of running `baked` through the same `toStacks` pass first. For the ordinary case
+(every baked item lands cleanly) the two lists happen to agree and the check works. The moment one
+container's baked list hits any of the three drop/collapse cases above, the stored entry and the
+raw list can never agree, no matter how many times the command runs — that one container gets
+reported "restored" again on every single re-run, exactly the symptom `sharedEntryMatchesBaked` was
+added to prevent. The fix: build the comparison set from `toStacks(baked, size)`, not from `baked`
+itself, so both sides go through identical normalization and a container that matched once keeps
+matching.
+
+**A genuine mismatch (not the false-negative `sharedEntryMatchesBaked` fixed above) must
+actually rewrite the entry, and `applyTemplate` alone cannot do that.** Once
+`sharedEntryMatchesBaked` (baked-items branch) or the direct loot-table id comparison
+(loot-table branch) correctly determines that an already-shared container's stored entry
+genuinely disagrees with the structure template — not a false negative from mismatched
+normalization, an actual difference — the fix has to overwrite that stored entry. But
+`ContainerRegistrar.applyTemplate` refuses outright to touch a position that already has a
+`SharedContainersState` entry, on purpose (see `ContainerRegistrar`'s own notes): that guard is
+exactly what keeps the passive scanner, `convert`, and the open path from ever clobbering real
+shared state, and it must stay that way for every caller except this one, deliberate,
+operator-triggered case. Calling the guarded `applyTemplate` for a genuine mismatch silently
+returns `null` — no restore happens, and the container falls into `skippedFailed` with a
+misleading "no readable inventory slots" log line that has nothing to do with the real reason.
+`ContainerRegistrar.applyTemplateReplacing` exists precisely for this: same write, `replaceExisting`
+forced `true`, callable only from here. Both `adopt-structure` branches route a genuine,
+already-`wasShared` mismatch through it (`registered = wasShared ? applyTemplateReplacing(...) :
+applyTemplate(...)`), and the freshly-registered-for-the-first-time case still goes through the
+guarded `applyTemplate`, unchanged.
 
 **`registerWithItems` places by recorded slot, not list position** — see
 `compat/NOTES.md`'s `FingerprintRegistry.java` entry. This command is the reason that
