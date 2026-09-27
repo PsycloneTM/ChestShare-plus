@@ -29,16 +29,6 @@ public final class SharedContainerEntry {
     public List<ItemStack> getInstance(UUID id) { return instances.get(id); }
     public void putInstance(UUID id, List<ItemStack> stacks) { instances.put(id, copy(stacks)); }
     public void clearInstances() { instances.clear(); }
-    /** Drops every player's cached copy that holds no items at all, keeping the ones with loot
-     *  still in them (a player mid-loot keeps their progress). Returns how many were dropped;
-     *  those players roll afresh from the template on next open. An all-empty copy is either a
-     *  player who legitimately took everything or a roll that came out empty when it should not
-     *  have (the loot table did not resolve, an old bug) - the entry cannot tell which. */
-    public int clearEmptyInstances() {
-        int before = instances.size();
-        instances.values().removeIf(stacks -> stacks.stream().allMatch(s -> s == null || s.isEmpty()));
-        return before - instances.size();
-    }
     public CompoundTag toNbt(HolderLookup.Provider registries) {
         CompoundTag nbt = new CompoundTag();
         nbt.put("Template", template.toNbt(registries));

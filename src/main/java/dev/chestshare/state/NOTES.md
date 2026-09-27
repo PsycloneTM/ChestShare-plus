@@ -40,26 +40,29 @@ serialization: `ItemStack.EMPTY` slots are omitted, and non-empty stacks
 retain their slot index so `fromNbt()` can restore them into the correct
 position even though the slot list format is now sparse.
 
-**`clearEmptyInstances()` — bounds `instances`' unbounded growth.** Every
-player who ever opens a given shared container gets a permanent entry here
+**An all-empty per-player entry is kept, not dropped.** Every player who
+ever opens a given shared container gets a permanent entry here
 (`putInstance` is called on every menu close, in `SharedContainerOpener`'s
-`save()`, regardless of what's left in the container), and nothing else in
-the map's lifecycle removes an entry — `clearInstances()` (used by
-`/chestshare reset`) wipes every player's entry at once, which is a
-different, admin-triggered operation, not per-entry pruning. Left
-unaddressed, a busy server with many players and many shared containers
-accumulates one `List<ItemStack>` per player per container forever, most of
-them eventually all-empty once a player has taken everything and never
-returns.
+`save()`, regardless of what's left in the container). Once a player fully
+empties their instance of a shared container, that all-empty entry is kept
+exactly like any other: `getOrCreateInstance` finds it on their next visit
+and returns the stored (empty) stacks rather than rolling from the template
+again. This is deliberate — a shared container is meant to be one-time
+personal loot, not a renewable resource, so a player who takes everything
+should find it empty if they come back, not get a second roll.
+`clearInstances()` (used by `/chestshare reset`) is still the only way to
+wipe an entry — a different, admin-triggered, whole-container operation,
+not per-player pruning.
 
-Called from `SharedContainerOpener.save()` (and the double-chest close
-handler, which writes to two entries directly rather than through `save()`)
-immediately after `putInstance`, so an entry that just became fully empty
-is dropped right at the moment it happened — the one point where it's safe
-to evaluate a player's own entry, since they just walked away from exactly
-that state. Removing an all-empty entry means that player rolls fresh from
-the template next time they open it, which is the correct, harmless outcome
-either way: they legitimately took everything (nothing lost by resetting),
-or a bug produced an empty roll that should have had loot (resetting is the
-recovery, not the damage). The entry itself can't distinguish the two
-cases, which is fine — both cases want the same outcome.
+The previous behavior instead dropped an entry the instant it went
+all-empty (`clearEmptyInstances()`, called right after `putInstance` in
+`save()` and in the double-chest close handler), which made that player
+roll fresh next time — worth knowing about if this needs revisiting, since
+it's what stopped `instances` from growing forever. That tradeoff is real
+again now: a busy server with many players and many shared containers
+accumulates one `List<ItemStack>` per player per container for the life of
+the world, empty ones included, with nothing pruning them. If that becomes
+a problem, the fix is not to bring back instant pruning (that's what
+reintroduces the free-fresh-roll loophole) — it's to prune only entries
+that are both empty and stale (untouched for a long time), which needs a
+last-accessed timestamp per entry that doesn't exist yet.
