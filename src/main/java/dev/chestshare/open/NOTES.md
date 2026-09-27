@@ -116,7 +116,9 @@ valid: block entity still placed, player in range) and vanilla's open/close hand
 `doubleChestFactory` itself still requires BOTH entries to be non-null - it calls
 `getInstance` on each. Callers must route the one-shared-one-ordinary case here.
 
-**`save()` calls `entry.clearEmptyInstances()` right after `putInstance`** —
-see `state/NOTES.md` for why. The double-chest close handler above doesn't
-go through `save()` (it writes to two entries directly), so it calls
-`clearEmptyInstances()` on both entries itself, for the same reason.
+**`save()` does not prune a fully-emptied entry** — a player who takes
+everything out stays recorded as empty, and finds it empty again on their
+next visit rather than getting a fresh roll. See `state/NOTES.md` for why,
+and for the unbounded-growth tradeoff that choice reopens. The double-chest
+close handler above doesn't go through `save()` (it writes to two entries
+directly), but follows the same rule: neither entry is pruned there either.

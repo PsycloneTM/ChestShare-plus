@@ -161,7 +161,7 @@ public final class SharedContainerOpener {
             ServerPlayer player=(ServerPlayer)p;
             List<ItemStack> first=getOrCreateInstance(world,player,primary,Vec3.atCenterOf(primaryPos),fallbackSeedFor(world,primaryPos),27);
             List<ItemStack> second=getOrCreateInstance(world,player,secondary,Vec3.atCenterOf(secondaryPos),fallbackSeedFor(world,secondaryPos),27);
-            SharedInventory si=new SharedInventory(54,x->{primary.putInstance(player.getUUID(),copyRange(x,0,27));secondary.putInstance(player.getUUID(),copyRange(x,27,54));primary.clearEmptyInstances();secondary.clearEmptyInstances();SharedContainersState.get(world).setDirty();},viewer->stateValidBlock(world,primaryPos,primary,viewer)&&stateValidBlock(world,secondaryPos,secondary,viewer));
+            SharedInventory si=new SharedInventory(54,x->{primary.putInstance(player.getUUID(),copyRange(x,0,27));secondary.putInstance(player.getUUID(),copyRange(x,27,54));SharedContainersState.get(world).setDirty();},viewer->stateValidBlock(world,primaryPos,primary,viewer)&&stateValidBlock(world,secondaryPos,secondary,viewer));
             for(int i=0;i<27;i++){si.setItem(i,first.get(i).copy());si.setItem(27+i,second.get(i).copy());} si.finishSeeding();
             return new ChestMenu(MenuType.GENERIC_9x6,sync,inv,si,6);
         });
@@ -205,7 +205,7 @@ public final class SharedContainerOpener {
     }
     private static MenuProvider provider(net.minecraft.network.chat.Component title, net.minecraft.world.inventory.MenuConstructor constructor){ return new MenuProvider(){public net.minecraft.network.chat.Component getDisplayName(){return title;} public AbstractContainerMenu createMenu(int id,Inventory inv,Player p){return constructor.createMenu(id,inv,p);}}; }
     private static void fill(SharedInventory inv,List<ItemStack> items){for(int i=0;i<inv.getContainerSize();i++)inv.setItem(i,i<items.size()?items.get(i).copy():ItemStack.EMPTY);}
-    private static void save(SharedContainerEntry entry,Player p,SharedInventory inv,ServerLevel world){entry.putInstance(p.getUUID(),ContainerRegistrar.copyContents(inv));entry.clearEmptyInstances();SharedContainersState.get(world).setDirty();}
+    private static void save(SharedContainerEntry entry,Player p,SharedInventory inv,ServerLevel world){entry.putInstance(p.getUUID(),ContainerRegistrar.copyContents(inv));SharedContainersState.get(world).setDirty();}
     private static boolean stateValidBlock(ServerLevel world,BlockPos pos,SharedContainerEntry e,Player p){return SharedContainersState.get(world).getBlock(pos)==e&&p.distanceToSqr(Vec3.atCenterOf(pos))<=MAX_USE_DISTANCE_SQ;}
     private static boolean stateValidEntity(ServerLevel world,MinecartChest cart,SharedContainerEntry e,Player p){return SharedContainersState.get(world).getEntity(cart.getUUID())==e&&!cart.isRemoved()&&p.distanceToSqr(cart.position())<=MAX_USE_DISTANCE_SQ;}
     public static List<ItemStack> getOrCreateInstance(ServerLevel world,ServerPlayer player,SharedContainerEntry entry,Vec3 origin,long fallbackSeed,int size){List<ItemStack> stored=entry.getInstance(player.getUUID()); if(stored!=null){List<ItemStack> out=new ArrayList<>();for(int i=0;i<size;i++)out.add(i<stored.size()?stored.get(i).copy():ItemStack.EMPTY);return out;} List<ItemStack> created=entry.template().createStacks(world,origin,player,fallbackSeed,size,world.registryAccess());entry.putInstance(player.getUUID(),created);SharedContainersState.get(world).setDirty();return created;}
